@@ -3496,7 +3496,93 @@ function validateNotificationPage(raw,c){const v=dto(raw,c,['items','nextCursor'
 return Object.freeze({validateAccess,validatePreview,validateShare,validateSharePage,validateNotificationPage,validateRecipients});
 });
 
-(function(root,factory){if(typeof module==='object')module.exports=factory(require('./personal-account-core.js'),require('./personal-backup.js'),require('./server-social-command.js'),require('./server-social-response.js'));else root.ServerSocialClient=factory(root.PersonalAccountCore,root.PersonalBackup,root.ServerSocialCommand,root.ServerSocialResponse);})(globalThis,function(Account,Backup,Social,Response){
+(function(root,factory){if(typeof module==='object')module.exports=factory(require('./personal-account-core.js'),require('./personal-backup.js'),require('./server-social-response.js'));else root.ShareCopySelection=factory(root.PersonalAccountCore,root.PersonalBackup,root.ServerSocialResponse);})(globalThis,function(Account,Backup,Response){
+'use strict';
+// Pure structural selection only. Ownership, anchors, duplicate identity, current
+// permission, policy and account/target revisions must be checked by the server.
+const MAX_BYTES=16*1024*1024,MAX_ITEMS=36600,encoder=new TextEncoder();
+const fail=()=>{throw Error('share-copy-selection-invalid');};
+function capture(raw){const value=Account.auditJSON(raw);if(encoder.encode(JSON.stringify(value)).length>MAX_BYTES)throw Error('share-copy-selection-size');return value;}
+function fields(value,keys){if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).length!==keys.length||keys.some(key=>!Object.hasOwn(value,key)))fail();}
+function integer(value,min=0,max=Number.MAX_SAFE_INTEGER){if(!Number.isSafeInteger(value)||Object.is(value,-0)||value<min||value>max)fail();}
+function text(value,max,nonempty=false){if(typeof value!=='string'||value.length>max||nonempty&&!value.trim())fail();}
+function id(value,max=80){text(value,max,true);if(['__proto__','constructor','prototype'].includes(value))fail();}
+function placeId(value){id(value);if(!/^[-A-Za-z0-9]+$/.test(value))fail();}
+function date(value){if(typeof value!=='string'||!/^\d{4}-\d{2}-\d{2}$/.test(value)||value<'1900-01-01'||value>'2200-12-31'||!Number.isFinite(Date.parse(value))||new Date(value+'T00:00:00Z').toISOString().slice(0,10)!==value)fail();}
+function zone(value){if(typeof value!=='string'||!/^[A-Za-z][A-Za-z0-9_+/-]{0,159}$/.test(value))fail();try{new Intl.DateTimeFormat('en',{timeZone:value});}catch{fail();}}
+function array(value,max){if(!Array.isArray(value)||value.length>max)fail();}
+function freeze(value){if(value&&typeof value==='object'){Object.values(value).forEach(freeze);Object.freeze(value);}return value;}
+function ref(value){fields(value,['day','order']);if(value.day!==null)integer(value.day,1,366);integer(value.order,0,MAX_ITEMS-1);return JSON.stringify([value.day,value.order]);}
+function publicMaterial(source){
+ const payload={kind:source.kind};if(source.title!==null){if(source.kind!=='trip')fail();payload.title=source.title;}if(source.description!==null)payload.description=source.description;
+ if(source.kind==='trip'){
+  payload.days=source.days.map(day=>({day:day.sourceDay,...(day.date===null?{}:{date:day.date}),places:[]}));
+  const days=new Map(payload.days.map(day=>[day.day,day]));for(const item of source.items){const day=days.get(item.source.day);if(!day||item.source.order!==day.places.length)fail();day.places.push(item.value);}
+ }else payload.places=source.items.map((item,order)=>{if(item.source.day!==null||item.source.order!==order)fail();return item.value;});
+ return {versionId:source.versionId,version:source.version,statusRevision:source.statusRevision,publishedAt:source.publishedAt,payload,quality:source.quality,provider:source.provider};
+}
+function sourceShape(raw){
+ const source=capture(raw);fields(source,['schemaVersion','binding','versionId','version','statusRevision','publishedAt','displayHash','kind','title','description','quality','provider','days','items']);
+ if(source.schemaVersion!==2||!['trip','place'].includes(source.kind)||typeof source.displayHash!=='string'||!/^[a-f0-9]{64}$/.test(source.displayHash))fail();
+ if(source.title!==null)text(source.title,MAX_BYTES);if(source.description!==null)text(source.description,MAX_BYTES);array(source.days,366);array(source.items,MAX_ITEMS);
+ let previous=0;for(const day of source.days){fields(day,['sourceDay','date']);integer(day.sourceDay,1,366);if(day.sourceDay<=previous)fail();previous=day.sourceDay;if(day.date!==null)date(day.date);}
+ if(source.kind==='place'&&source.days.length)fail();
+ let previousDay=0,previousOrder=-1;for(const item of source.items){fields(item,['source','value']);ref(item.source);if(source.kind==='trip'){if(item.source.day===null||item.source.day<previousDay||item.source.day===previousDay&&item.source.order!==previousOrder+1||item.source.day!==previousDay&&item.source.order!==0)fail();previousDay=item.source.day;previousOrder=item.source.order;if(item.source.order>=100)fail();}}
+ const material=publicMaterial(source),context={...source.binding,epoch:0};Response.validateShare({schemaVersion:1,binding:source.binding,share:material},context,source.versionId);
+ return source;
+}
+async function captureSource(raw,currentContext){
+ // Capture response and context before hashing; caller mutation cannot change it.
+ const value=capture(raw),context=capture(currentContext),checked=Response.validateShare(value,context,value.share?.versionId),share=checked.share;
+ const days=[],items=[];
+ if(share.payload.kind==='trip')for(const day of [...share.payload.days].sort((a,b)=>a.day-b.day)){
+  if(day.places.length>100)fail();if(Object.hasOwn(day,'date'))date(day.date);days.push({sourceDay:day.day,date:day.date??null});day.places.forEach((row,order)=>items.push({source:{day:day.day,order},value:row}));
+ }else share.payload.places.forEach((row,order)=>items.push({source:{day:null,order},value:row}));
+ if(items.length>MAX_ITEMS)fail();
+ const displayHash=await Backup.digest(share);
+ return freeze(capture({schemaVersion:2,binding:checked.binding,versionId:share.versionId,version:share.version,statusRevision:share.statusRevision,publishedAt:share.publishedAt,displayHash,kind:share.payload.kind,title:share.payload.title??null,description:share.payload.description??null,quality:share.quality,provider:share.provider,days,items}));
+}
+function resolution(value,destination,action){
+ fields(value,['name','type','time','location','googlePlaceId','dwellSeconds','travel']);text(value.name,destination==='place'?120:160,true);if(!['castle','unknown','food','hotel','cafe'].includes(value.type))fail();
+ if(typeof value.time!=='string'||value.time!==''&&!/^([01]\d|2[0-3]):[0-5]\d$/.test(value.time))fail();
+ if(value.location!==null)text(value.location,destination==='place'?300:500);if(destination==='place'&&action==='ADD'&&(value.location===null||!value.location.trim()))fail();
+ if(value.googlePlaceId!==null){text(value.googlePlaceId,256,true);if(value.googlePlaceId!==value.googlePlaceId.trim()||/[\u0000-\u001f]/.test(value.googlePlaceId))fail();}
+ if(value.dwellSeconds!==null)integer(value.dwellSeconds);if(![null,'required','none'].includes(value.travel))fail();
+}
+function captureTarget(raw,rawSource){
+ const value=capture(raw),source=sourceShape(rawSource);fields(value,['schemaVersion','destination','days','items']);if(value.schemaVersion!==2)fail();
+ const d=value.destination;if(d?.kind==='trip'){
+  fields(d,['kind','targetId','expectedTargetRevision','title']);integer(d.expectedTargetRevision);if(d.targetId===null){if(d.expectedTargetRevision!==0)fail();text(d.title,120,true);}else{id(d.targetId,160);integer(d.expectedTargetRevision,1);if(d.title!==null)fail();}
+ }else{fields(d,['kind','targetId','expectedTargetRevision']);if(d.kind!=='place'||d.targetId!=='saved-places')fail();integer(d.expectedTargetRevision);}
+ array(value.items,MAX_ITEMS);if(value.items.length!==source.items.length)fail();const sourceItems=new Map(source.items.map(item=>[ref(item.source),item])),items=new Map(),selectedDays=new Set();
+ for(const item of value.items){
+  fields(item,['source','action','existingPlaceId','existingStopId','resolution']);const key=ref(item.source);if(!sourceItems.has(key)||items.has(key))fail();items.set(key,item);
+  if(item.action==='SKIP'){if(item.resolution!==null||item.existingPlaceId!==null)fail();if(item.existingStopId!==null)id(item.existingStopId);}
+  else{
+   if(!['ADD','LINK'].includes(item.action)||item.existingStopId!==null)fail();if(item.action==='LINK')placeId(item.existingPlaceId);else if(item.existingPlaceId!==null)fail();resolution(item.resolution,d.kind,item.action);selectedDays.add(item.source.day);
+  }
+ }
+ array(value.days,366);const mappings=new Map(),newKeys=new Set(),targetDays=new Map();
+ if(d.kind==='place'){if(value.days.length)fail();}
+ else{
+  if(value.days.length!==selectedDays.size)fail();
+  for(const day of value.days){
+   fields(day,['sourceDay','targetDayKey','date','timeZone','position','afterStopId']);if(day.sourceDay!==null)integer(day.sourceDay,1,366);if(!selectedDays.has(day.sourceDay)||mappings.has(day.sourceDay))fail();mappings.set(day.sourceDay,day);
+   if(typeof day.targetDayKey!=='string'||!/^\d+$/.test(day.targetDayKey)||String(Number(day.targetDayKey))!==day.targetDayKey)fail();integer(Number(day.targetDayKey),1,366);date(day.date);zone(day.timeZone);
+   if(!['START','END','AFTER'].includes(day.position))fail();if(day.position==='AFTER')id(day.afterStopId);else if(day.afterStopId!==null)fail();
+   if(d.targetId===null){if(day.position!=='END'||newKeys.has(day.targetDayKey))fail();newKeys.add(day.targetDayKey);}
+   const previous=targetDays.get(day.targetDayKey);if(previous&&(previous.date!==day.date||previous.timeZone!==day.timeZone))fail();targetDays.set(day.targetDayKey,day);
+  }
+  if(d.targetId===null)for(let i=1;i<=newKeys.size;i++)if(!newKeys.has(String(i)))fail();
+  const counts=new Map();for(const item of value.items)if(item.action!=='SKIP'){const key=mappings.get(item.source.day).targetDayKey,count=(counts.get(key)||0)+1;if(count>100)fail();counts.set(key,count);}
+ }
+ value.items=source.items.map(item=>items.get(ref(item.source)));
+ const sourceOrder=source.kind==='place'?[null]:source.days.map(day=>day.sourceDay);value.days=sourceOrder.filter(day=>mappings.has(day)).map(day=>mappings.get(day));return freeze(value);
+}
+return Object.freeze({captureSource,captureTarget});
+});
+
+(function(root,factory){if(typeof module==='object')module.exports=factory(require('./personal-account-core.js'),require('./personal-backup.js'),require('./server-social-command.js'),require('./server-social-response.js'),require('./share-copy-selection.js'));else root.ServerSocialClient=factory(root.PersonalAccountCore,root.PersonalBackup,root.ServerSocialCommand,root.ServerSocialResponse,root.ShareCopySelection);})(globalThis,function(Account,Backup,Social,Response,CopySelection){
 'use strict';
 const fail=()=>{throw Error('social-client-invalid');},enc=new TextEncoder();
 function userId(user){if(!user||typeof user!=='object')fail();const d=Object.getOwnPropertyDescriptor(user,'id');if(!d||!Object.hasOwn(d,'value')||typeof d.value!=='string')fail();return d.value;}
@@ -3513,8 +3599,9 @@ async function connect({session}){
  async function operation(raw,mode){const x=await captured(raw);guard();const type=x.request.command.type;let name;if(type==='share-preview')name=mode==='submit'?'preview_share_v1':mode==='lookup'?'get_share_preview_checked_v1':'cancel_share_preview_v1';else if(mode!=='submit')name=mode==='lookup'?'get_social_operation_checked_v1':'cancel_social_operation_v1';else name={'share-publish':'publish_share_v1','share-revoke':'revoke_share_v1','notifications-mark-read':'mark_notifications_read_v1','social-block':'set_social_block_v1'}[type];if(!name)fail();const data=await rpc(name,{p_request_id:x.request.requestId,p_command:x.request.command});guard();const result=type==='share-preview'?await Response.validatePreview(data,x,context):mode==='submit'?await Social.validateReceipt(data,x,context,0):await Social.validateChecked(data,x,context,0);guard();return result;}
  async function read(name,args,validate){guard();const a=Account.auditJSON(args);guard();const data=await rpc(name,a);guard();const result=await validate(data);guard();return result;}
  async function list(raw,notifications){guard();const a=Account.auditJSON(raw);guard();exact(a,['filter','cursor','limit']);if(!(notifications?['all','unread']:['mine','received','feed']).includes(a.filter)||!Number.isSafeInteger(a.limit)||a.limit<1||a.limit>20000)fail();if(a.cursor!==null)id(a.cursor);const result=await read(notifications?'list_notifications_v1':'list_shares_v1',{p_filter:a.filter,p_cursor:a.cursor,p_limit:a.limit},v=>notifications?Response.validateNotificationPage(v,context):Response.validateSharePage(v,context));guard();if(result.items.length>a.limit)fail();if(notifications){const filterHash=await Backup.digest(a.filter);guard();if(result.highWater.filterHash!==filterHash)fail();if(a.filter==='unread'&&result.items.some(v=>v.readAt!==null))fail();}return result;}
+ async function getCopySource(versionId){guard();id(versionId);const raw=await read('get_share_v1',{p_version_id:versionId},v=>Response.validateShare(v,context,versionId));guard();const source=await CopySelection.captureSource(raw,context);guard();return source;}
  async function listRecipients(raw){guard();const a=Account.auditJSON(raw);guard();exact(a,['query','cursor','limit']);if(typeof a.query!=='string'||a.query.length>36||!Number.isSafeInteger(a.limit)||a.limit<1||a.limit>50)fail();for(let i=0;i<a.query.length;i++)if([8,13,18,23].includes(i)?a.query[i]!=='-':!/[a-f0-9]/.test(a.query[i]))fail();if(a.cursor!==null){exact(a.cursor,['kind','binding','query','policyVersion','afterMemberId']);if(a.cursor.kind!=='recipient-position-v1'||a.cursor.query!==a.query||Backup.canonical(a.cursor.binding)!==Backup.canonical(access)||!Number.isSafeInteger(a.cursor.policyVersion)||a.cursor.policyVersion<1||typeof a.cursor.afterMemberId!=='string'||!(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/).test(a.cursor.afterMemberId)||!a.cursor.afterMemberId.startsWith(a.query))fail();}guard();return read('list_share_recipients_v1',{p_query:a.query,p_cursor:a.cursor,p_limit:a.limit},v=>Response.validateRecipients(v,{...context,...a}));}
- return Object.freeze({context(){guard();return context;},guard,listRecipients,submit:x=>operation(x,'submit'),lookup:x=>operation(x,'lookup'),cancel:x=>operation(x,'cancel'),getShare(versionId){guard();id(versionId);return read('get_share_v1',{p_version_id:versionId},v=>Response.validateShare(v,context,versionId));},listShares:a=>list(a,false),listNotifications:a=>list(a,true),unreadCount:()=>read('get_unread_count_v1',{},v=>Social.validateUnreadCount(v,context)),resolveNotification(notificationId){guard();id(notificationId);return read('resolve_notification_target_v1',{p_notification_id:notificationId},v=>Social.validateDestination(v,context,notificationId));}});
+ return Object.freeze({context(){guard();return context;},guard,listRecipients,getCopySource,submit:x=>operation(x,'submit'),lookup:x=>operation(x,'lookup'),cancel:x=>operation(x,'cancel'),getShare(versionId){guard();id(versionId);return read('get_share_v1',{p_version_id:versionId},v=>Response.validateShare(v,context,versionId));},listShares:a=>list(a,false),listNotifications:a=>list(a,true),unreadCount:()=>read('get_unread_count_v1',{},v=>Social.validateUnreadCount(v,context)),resolveNotification(notificationId){guard();id(notificationId);return read('resolve_notification_target_v1',{p_notification_id:notificationId},v=>Social.validateDestination(v,context,notificationId));}});
 }
 return Object.freeze({connect});
 });
