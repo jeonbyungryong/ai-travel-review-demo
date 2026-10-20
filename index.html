@@ -941,6 +941,11 @@ function createSession(client,project,onChange=()=>{}){
   const validated=name==='get_personal_account'?helper.validateAccount(result.data,context):helper.validateReceipt(result.data,context,command,name==='get_personal_operation_checked');check(c);return validated;
  }
  async function getPersonal(){const c=current();personalValidator();return personalRPC(c,'get_personal_account',{});}
+ async function getStorageStatusRPC(){
+  const c=current(),helper=personalValidator();let raw;
+  try{const work=client.rpc('get_account_storage_status_v1',{});raw=await(typeof work?.retry==='function'?work.retry(false):work);}catch{check(c);throw Error('storage-status-unavailable');}
+  check(c);const result=rpcResponse(raw);if(result.error)throw Error('storage-status-unavailable');const data=helper.auditJSON(result.data);check(c);return {data,error:null};
+ }
  function legacyTimestamp(value){
   if(typeof value!=='string'||!/^\d{4}-\d\d-\d\dT(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,6})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(value)||!Number.isFinite(Date.parse(value)))throw Error('invalid-legacy-timestamp');
   const day=value.slice(0,10),date=new Date(day+'T00:00:00Z');if(!Number.isFinite(date.getTime())||date.toISOString().slice(0,10)!==day)throw Error('invalid-legacy-timestamp');
@@ -999,6 +1004,11 @@ function createSession(client,project,onChange=()=>{}){
   else if(['get_social_access_v1','get_unread_count_v1'].includes(name))keys=[];
   else if(name==='get_share_v1'){keys=['p_version_id'];requestId(input?.p_version_id);}
   else if(name==='resolve_notification_target_v1'){keys=['p_notification_id'];requestId(input?.p_notification_id);}
+  else if(name==='list_share_recipients_v1'){
+   keys=['p_query','p_cursor','p_limit'];if(typeof input?.p_query!=='string'||input.p_query.length>36||!Number.isSafeInteger(input.p_limit)||input.p_limit<1||input.p_limit>50)throw Error('invalid-social-rpc');
+   for(let i=0;i<input.p_query.length;i++)if([8,13,18,23].includes(i)?input.p_query[i]!=='-':!/[a-f0-9]/.test(input.p_query[i]))throw Error('invalid-social-rpc');
+   if(input.p_cursor!==null&&(!input.p_cursor||typeof input.p_cursor!=='object'||Array.isArray(input.p_cursor)))throw Error('invalid-social-rpc');
+  }
   else if(['list_shares_v1','list_notifications_v1'].includes(name)){
    keys=['p_filter','p_cursor','p_limit'];const filters=name==='list_shares_v1'?['mine','received','feed']:['all','unread'];
    if(!filters.includes(input?.p_filter)||!Number.isSafeInteger(input?.p_limit)||input.p_limit<1||input.p_limit>20000)throw Error('invalid-social-rpc');if(input.p_cursor!==null)requestId(input.p_cursor);
@@ -1007,7 +1017,7 @@ function createSession(client,project,onChange=()=>{}){
   let response;try{check(c);const work=client.rpc(name,input);response=await(typeof work?.retry==='function'?work.retry(false):work);}catch{check(c);throw Error('social-result-unknown');}check(c);
   let data;try{if(!response||typeof response!=='object')throw Error();const ds=Object.getOwnPropertyDescriptors(response);if(!ds.data||!Object.hasOwn(ds.data,'value')||!ds.error||!Object.hasOwn(ds.error,'value')||ds.error.value!==null)throw Error();data=helper.auditJSON(ds.data.value);}catch{check(c);throw Error('social-result-unknown');}check(c);return {data,error:null};
  }
- return {signIn,signOut,list,get,save,saveOperation,cancelOperation,operation,resolveTripOperation,getPersonal,getLegacyPersonalSource,savePersonalOperation,cancelPersonalOperation,personalOperation,itineraryDraftRPC,calculationAcceptanceRPC,calculationJobRPC,itineraryConfirmationRPC,selectionJobRPC,socialRPC,history,exportTrips,guard(){const c=current();return ()=>check(c);},user:()=>user?{...user}:null,scope:()=>project+':'+current().user.id};
+ return {signIn,signOut,list,get,save,saveOperation,cancelOperation,operation,resolveTripOperation,getPersonal,getStorageStatusRPC,getLegacyPersonalSource,savePersonalOperation,cancelPersonalOperation,personalOperation,itineraryDraftRPC,calculationAcceptanceRPC,calculationJobRPC,itineraryConfirmationRPC,selectionJobRPC,socialRPC,history,exportTrips,guard(){const c=current();return ()=>check(c);},user:()=>user?{...user}:null,scope:()=>project+':'+current().user.id};
 }
 return {config,createSession};
 });
@@ -3336,6 +3346,33 @@ function validateReceipt(raw,context,command,allowMissing=false){
 return {auditJSON,captureCommand,validateAccount,validateReceipt,preflightBundle};
 });
 
+(function(root,factory){if(typeof module==='object')module.exports=factory(require('./personal-account-core.js'));else root.PersonalAccountStorage=factory(root.PersonalAccountCore);})(globalThis,function(Account){
+'use strict';
+const invalid=()=>{throw Error('storage-status-invalid');},uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+function exact(v,keys){if(!v||typeof v!=='object'||Array.isArray(v)||Object.keys(v).length!==keys.length||keys.some(k=>!Object.hasOwn(v,k)))invalid();}
+function count(v){if(!Number.isSafeInteger(v)||v<0)invalid();}
+function owner(session){const u=session.user(),d=u&&Object.getOwnPropertyDescriptor(u,'id');if(!d||!Object.hasOwn(d,'value')||typeof d.value!=='string'||!uuid.test(d.value))invalid();return d.value;}
+function validate(raw,ownerId){
+ const r=Account.auditJSON(raw);exact(r,['schemaVersion','ownerId','memberGeneration','observedAt','accountLimitBytes','operationLimitBytes','operationLimitCount','usage']);
+ if(r.schemaVersion!==1||typeof r.ownerId!=='string'||!uuid.test(r.ownerId)||ownerId&&r.ownerId!==ownerId)invalid();count(r.memberGeneration);if(r.memberGeneration===0)invalid();
+ if(typeof r.observedAt!=='string'||!/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/.test(r.observedAt)||!Number.isFinite(Date.parse(r.observedAt))||new Date(r.observedAt).toISOString()!==r.observedAt)invalid();
+ for(const key of ['accountLimitBytes','operationLimitBytes','operationLimitCount'])if(r[key]!==null)count(r[key]);
+ exact(r.usage,['personalBytes','legacyTripBytes','legacyHistoryBytes','operationBytes','operationCount','totalBytes']);for(const n of Object.values(r.usage))count(n);
+ const total=r.usage.personalBytes+r.usage.legacyTripBytes+r.usage.legacyHistoryBytes+r.usage.operationBytes;if(!Number.isSafeInteger(total)||total!==r.usage.totalBytes)invalid();
+ Object.freeze(r.usage);return Object.freeze(r);
+}
+async function read(session){
+ if(!session||typeof session.guard!=='function'||typeof session.user!=='function'||typeof session.getStorageStatusRPC!=='function')invalid();
+ const guard=session.guard();if(typeof guard!=='function')invalid();guard();const ownerId=owner(session);guard();
+ function current(){guard();if(owner(session)!==ownerId)throw Error('session-changed');guard();}
+ let raw;try{raw=await session.getStorageStatusRPC();}catch(e){current();throw e;}current();
+ const wire=Account.auditJSON(raw);exact(wire,['data','error']);if(wire.error!==null)throw Error('storage-status-unavailable');const r=validate(wire.data,ownerId);current();return r;
+}
+function bytes(n){return n>=1048576?(n/1048576).toFixed(2)+' MiB':n>=1024?(n/1024).toFixed(2)+' KiB':n+' B';}
+function summary(raw){const r=validate(raw),u=r.usage,quota=n=>n===null?'미설정':bytes(n);return '개인 계정 논리 저장 '+bytes(u.totalBytes)+' / 한도 '+quota(r.accountLimitBytes)+' · 작업 기록 '+bytes(u.operationBytes)+' / 한도 '+quota(r.operationLimitBytes)+' · 기록 '+u.operationCount+'개 / 한도 '+(r.operationLimitCount===null?'미설정':r.operationLimitCount+'개')+' · 조회 '+r.observedAt+' · 공유·알림·인증·파일·전송과 프로젝트 물리 DB 총량은 포함하지 않아요.';}
+return Object.freeze({read,summary});
+});
+
 (function(root,factory){if(typeof module==='object')module.exports=factory(require('./personal-account-core.js'),require('./personal-backup.js'));else root.ServerSocialCommand=factory(root.PersonalAccountCore,root.PersonalBackup);})(globalThis,function(Account,Backup){
 'use strict';
 // Structural protocol ceilings only; operating quotas and authority belong to the server.
@@ -3449,10 +3486,14 @@ function payload(v,privatePreview){const trip=v?.kind==='trip';if(!trip&&v?.kind
 async function validatePreview(raw,rawCaptured,context){const v=capture(raw),x=capture(rawCaptured),c=capture(context);const expected=await Social.captureRequest(x.request,c);same(x,expected);if(x.request.command.type!=='share-preview')fail();shape(v,v.state==='NOT_FOUND'?['schemaVersion','state','requestId','requestHash','binding']:['schemaVersion','requestId','requestHash','normalizationVersion','state','binding','preview','projection','reason']);if(v.schemaVersion!==1||v.requestId!==x.request.requestId||v.requestHash!==x.requestHash)fail();same(v.binding,bound(c));if(v.state==='NOT_FOUND')return freeze(v);if(v.normalizationVersion!=='pg-jsonb-v1'||!['PENDING','READY','FAILED','CANCELLED'].includes(v.state))fail();if(v.state!=='READY'){if(v.preview!==null||v.projection!==null)fail();if(v.state==='PENDING'&&v.reason!==null||v.state==='CANCELLED'&&v.reason!=='owner-cancelled'||v.state==='FAILED'&&!['projection-failed','preview-expired-or-attempts'].includes(v.reason))fail();return freeze(v);}if(v.reason!==null)fail();const token=Social.validatePreviewBinding(v.preview,x.request.command,c),p=v.projection,cmd=x.request.command;shape(p,['schemaVersion','policyVersion','sourceBinding','payload','quality','excluded','projectionHash','bytes']);if(p.schemaVersion!==1||p.policyVersion!==token.policyVersion||p.projectionHash!==token.projectionHash)fail();hash(p.projectionHash);integer(p.bytes);same(p.sourceBinding,{scope:c.scope,ownerId:c.ownerId,accountRevision:cmd.expectedAccountRevision,sourceKind:cmd.source.kind,sourceId:cmd.source.id,sourceRevision:cmd.source.revision,sourceHash:cmd.source.hash});payload(p.payload,true);if(p.payload.kind!==cmd.source.kind)fail();if(cmd.selection.days!==null&&(p.payload.days.length!==cmd.selection.days.length||p.payload.days.some(d=>!cmd.selection.days.includes(d.day))))fail();if(cmd.selection.placeIds!==null&&p.payload.places.length!==cmd.selection.placeIds.length)fail();if(Object.hasOwn(p.payload,'description')&&p.payload.description!==cmd.selection.description)fail();quality(p.quality,p.payload.kind);if(!Array.isArray(p.excluded))fail();let previous=null;for(const e of p.excluded){shape(e,['path','reason']);if(typeof e.path!=='string'||!e.path.startsWith('/')||previous!==null&&e.path<=previous||!['private-or-unsupported','policy-excluded','not-selected','provider-source-unbound','provider-policy-unapproved','provider-rights-unverified','provider-provenance-unverified','provider-expired','provider-ineligible'].includes(e.reason))fail();previous=e.path;}const {projectionHash,bytes,...material}=p;if(bytes!==enc.encode(Backup.canonical(p.payload)).length||projectionHash!==await Backup.digest(material))fail();return freeze(v);}
 function share(v){shape(v,['versionId','version','statusRevision','publishedAt','payload','quality','provider']);id(v.versionId);integer(v.version,1);integer(v.statusRevision,1);instant(v.publishedAt);payload(v.payload,false);quality(v.quality,v.payload.kind);shape(v.provider,['state','reason']);if(v.provider.state!=='MASKED'||v.provider.reason!=='provider-current-eligibility-unverified')fail();}
 function validateShare(raw,c,versionId){id(versionId);const v=dto(raw,c,['share']);share(v.share);if(v.share.versionId!==versionId)fail();return freeze(v);}
+function uuid(v){if(typeof v!=='string'||!(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/).test(v))fail();}
+function recipientQuery(v){if(typeof v!=='string'||v.length>36)fail();for(let i=0;i<v.length;i++)if([8,13,18,23].includes(i)?v[i]!=='-':!/[a-f0-9]/.test(v[i]))fail();}
+function recipientCursor(v,c){shape(v,['kind','binding','query','policyVersion','afterMemberId']);if(v.kind!=='recipient-position-v1')fail();same(v.binding,bound(c));recipientQuery(v.query);if(v.query!==c.query)fail();integer(v.policyVersion,1);uuid(v.afterMemberId);if(!v.afterMemberId.startsWith(v.query))fail();}
+function validateRecipients(raw,c){const v=dto(raw,c,['policyVersion','selectionLimit','query','items','nextCursor']);recipientQuery(v.query);if(v.query!==c.query)fail();integer(v.policyVersion,1);integer(v.selectionLimit,1);integer(c.limit,1);if(c.limit>50||!Array.isArray(v.items)||v.items.length>c.limit)fail();let previous=null;if(c.cursor!==null){recipientCursor(c.cursor,c);if(c.cursor.policyVersion!==v.policyVersion)fail();previous=c.cursor.afterMemberId;}for(const x of v.items){shape(x,['memberId']);uuid(x.memberId);if(x.memberId===c.ownerId||!x.memberId.startsWith(v.query)||previous!==null&&x.memberId<=previous)fail();previous=x.memberId;}if(v.nextCursor!==null){recipientCursor(v.nextCursor,c);if(v.nextCursor.policyVersion!==v.policyVersion||!v.items.length||v.nextCursor.afterMemberId!==previous||v.items.length!==c.limit)fail();}return freeze(v);}
 function page(v){if(!Array.isArray(v.items))fail();if(v.nextCursor!==null)id(v.nextCursor);}
 function validateSharePage(raw,c){const v=dto(raw,c,['items','nextCursor']);page(v);const seen=new Set();v.items.forEach(x=>{share(x);if(seen.has(x.versionId))fail();seen.add(x.versionId);});return freeze(v);}
 function validateNotificationPage(raw,c){const v=dto(raw,c,['items','nextCursor','highWater','count','countRevision']);page(v);Social.validateUnreadCount({schemaVersion:1,binding:v.binding,count:v.count,countRevision:v.countRevision},c);const h=v.highWater;shape(h,['kind','id','sequence','filterHash','memberGeneration']);if(h.kind!=='notification-high-water'||h.memberGeneration!==c.memberGeneration)fail();id(h.id);hash(h.filterHash);integer(h.sequence);if(v.countRevision<h.sequence||v.count<v.items.filter(x=>x.readAt===null).length)fail();const seen=new Set();let seq=0,readRevision=null;for(const x of v.items){Social.validateNotification(x,c);if(readRevision!==null&&readRevision!==x.readRevision||x.readRevision>v.countRevision-h.sequence)fail();readRevision=x.readRevision;if(seen.has(x.notificationId)||x.createdSequence<=seq||x.createdSequence>h.sequence)fail();seen.add(x.notificationId);seq=x.createdSequence;}return freeze(v);}
-return Object.freeze({validateAccess,validatePreview,validateShare,validateSharePage,validateNotificationPage});
+return Object.freeze({validateAccess,validatePreview,validateShare,validateSharePage,validateNotificationPage,validateRecipients});
 });
 
 (function(root,factory){if(typeof module==='object')module.exports=factory(require('./personal-account-core.js'),require('./personal-backup.js'),require('./server-social-command.js'),require('./server-social-response.js'));else root.ServerSocialClient=factory(root.PersonalAccountCore,root.PersonalBackup,root.ServerSocialCommand,root.ServerSocialResponse);})(globalThis,function(Account,Backup,Social,Response){
@@ -3472,7 +3513,8 @@ async function connect({session}){
  async function operation(raw,mode){const x=await captured(raw);guard();const type=x.request.command.type;let name;if(type==='share-preview')name=mode==='submit'?'preview_share_v1':mode==='lookup'?'get_share_preview_checked_v1':'cancel_share_preview_v1';else if(mode!=='submit')name=mode==='lookup'?'get_social_operation_checked_v1':'cancel_social_operation_v1';else name={'share-publish':'publish_share_v1','share-revoke':'revoke_share_v1','notifications-mark-read':'mark_notifications_read_v1','social-block':'set_social_block_v1'}[type];if(!name)fail();const data=await rpc(name,{p_request_id:x.request.requestId,p_command:x.request.command});guard();const result=type==='share-preview'?await Response.validatePreview(data,x,context):mode==='submit'?await Social.validateReceipt(data,x,context,0):await Social.validateChecked(data,x,context,0);guard();return result;}
  async function read(name,args,validate){guard();const a=Account.auditJSON(args);guard();const data=await rpc(name,a);guard();const result=await validate(data);guard();return result;}
  async function list(raw,notifications){guard();const a=Account.auditJSON(raw);guard();exact(a,['filter','cursor','limit']);if(!(notifications?['all','unread']:['mine','received','feed']).includes(a.filter)||!Number.isSafeInteger(a.limit)||a.limit<1||a.limit>20000)fail();if(a.cursor!==null)id(a.cursor);const result=await read(notifications?'list_notifications_v1':'list_shares_v1',{p_filter:a.filter,p_cursor:a.cursor,p_limit:a.limit},v=>notifications?Response.validateNotificationPage(v,context):Response.validateSharePage(v,context));guard();if(result.items.length>a.limit)fail();if(notifications){const filterHash=await Backup.digest(a.filter);guard();if(result.highWater.filterHash!==filterHash)fail();if(a.filter==='unread'&&result.items.some(v=>v.readAt!==null))fail();}return result;}
- return Object.freeze({context(){guard();return context;},guard,submit:x=>operation(x,'submit'),lookup:x=>operation(x,'lookup'),cancel:x=>operation(x,'cancel'),getShare(versionId){guard();id(versionId);return read('get_share_v1',{p_version_id:versionId},v=>Response.validateShare(v,context,versionId));},listShares:a=>list(a,false),listNotifications:a=>list(a,true),unreadCount:()=>read('get_unread_count_v1',{},v=>Social.validateUnreadCount(v,context)),resolveNotification(notificationId){guard();id(notificationId);return read('resolve_notification_target_v1',{p_notification_id:notificationId},v=>Social.validateDestination(v,context,notificationId));}});
+ async function listRecipients(raw){guard();const a=Account.auditJSON(raw);guard();exact(a,['query','cursor','limit']);if(typeof a.query!=='string'||a.query.length>36||!Number.isSafeInteger(a.limit)||a.limit<1||a.limit>50)fail();for(let i=0;i<a.query.length;i++)if([8,13,18,23].includes(i)?a.query[i]!=='-':!/[a-f0-9]/.test(a.query[i]))fail();if(a.cursor!==null){exact(a.cursor,['kind','binding','query','policyVersion','afterMemberId']);if(a.cursor.kind!=='recipient-position-v1'||a.cursor.query!==a.query||Backup.canonical(a.cursor.binding)!==Backup.canonical(access)||!Number.isSafeInteger(a.cursor.policyVersion)||a.cursor.policyVersion<1||typeof a.cursor.afterMemberId!=='string'||!(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/).test(a.cursor.afterMemberId)||!a.cursor.afterMemberId.startsWith(a.query))fail();}guard();return read('list_share_recipients_v1',{p_query:a.query,p_cursor:a.cursor,p_limit:a.limit},v=>Response.validateRecipients(v,{...context,...a}));}
+ return Object.freeze({context(){guard();return context;},guard,listRecipients,submit:x=>operation(x,'submit'),lookup:x=>operation(x,'lookup'),cancel:x=>operation(x,'cancel'),getShare(versionId){guard();id(versionId);return read('get_share_v1',{p_version_id:versionId},v=>Response.validateShare(v,context,versionId));},listShares:a=>list(a,false),listNotifications:a=>list(a,true),unreadCount:()=>read('get_unread_count_v1',{},v=>Social.validateUnreadCount(v,context)),resolveNotification(notificationId){guard();id(notificationId);return read('resolve_notification_target_v1',{p_notification_id:notificationId},v=>Social.validateDestination(v,context,notificationId));}});
 }
 return Object.freeze({connect});
 });
@@ -7528,6 +7570,8 @@ root.ServerItineraryAccountUI={open,isBusy:()=>!!current?.working,cancelPending(
 const esc=value=>escapeText(String(value??''));
 // A local journal ceiling, never an operating sharing quota.
 const JOURNAL_BYTES=32*1024*1024;
+// Access DTO has no negotiated page ceiling; one row is valid for every active policy.
+const PAGE_SIZE=1;
 let configured=false,configuredSession=null,generation=0,current=null,badge=null,badgeError=false,badgeObservation=0;
 function button(s,label,action,attrs=''){
  return '<button type="button" class="btn" style="min-height:44px" data-social-account="'+action+'" '+(s.working||!s.initialized?'disabled ':'')+attrs+'>'+esc(label)+'</button>';
@@ -7538,7 +7582,7 @@ function valid(s){
 }
 function check(s){if(!valid(s))throw Error('social-screen-changed');}
 async function step(s,fn){check(s);try{const value=await fn();check(s);return value;}catch(error){check(s);throw error;}}
-function purge(s){s.detail=null;s.confirm=null;s.compose=false;s.account=null;s.shares=null;s.notifications=null;s.pending=null;s.notice='계정이나 화면이 바뀌었습니다.';if(s.panel)s.panel.innerHTML='';}
+function purge(s){s.detail=null;s.confirm=null;s.compose=false;s.account=null;s.shares=null;s.notifications=null;s.pending=null;s.recipientPage=null;s.recipientIds=[];s.recipientKnown=new Set();s.draft=null;s.notice='계정이나 화면이 바뀌었습니다.';if(s.panel)s.panel.innerHTML='';}
 function afterRender(){
  if(!configured)return;
  const banner=document.querySelector('.user-banner');if(!banner)return;
@@ -7579,11 +7623,15 @@ function pendingHTML(s){
  else html+=button(s,'이 요청 취소 검토','cancel-review');
  return html+'</div></section>';
 }
+function recipientHTML(s){
+ const ids=s.recipientIds||[],page=s.recipientPage;
+ return '<section><h4>지정 회원 선택</h4><p>이름·이메일이 제공되지 않아 opaque 회원 ID로 구별합니다. 검색을 바꿔도 선택은 유지합니다. 미리보기·발행 때 서버가 자격을 다시 검사합니다.</p><label class="field">회원 ID 앞부분 · 비우면 전체 후보<input class="input" name="recipientQuery" autocomplete="off" maxlength="36" value="'+esc(s.draft?.recipientQuery||'')+'"></label>'+button(s,'회원 조회','recipients-search')+'<div id="social-account-recipient-results">'+(s.recipientError?'<p role="alert">회원 조회에 실패했습니다. 후보와 선택을 지웠습니다. 조건을 좁히거나 연결·정책을 확인하세요.</p>':page?'<p>서버 지정 한도 '+esc(page.selectionLimit)+'명</p>'+(!page.items.length?'<p>조건에 맞는 회원이 없습니다.</p>':'<ul>'+page.items.map(x=>'<li><label><input type="checkbox" data-social-account="recipient-toggle" data-id="'+esc(x.memberId)+'" '+(ids.includes(x.memberId)?'checked ':'')+(s.working?'disabled ':'')+'>'+esc(x.memberId)+'</label></li>').join('')+'</ul>')+(page.nextCursor?button(s,'회원 다음 페이지','recipients-next'):''):'<p>회원 목록 미조회</p>')+'</div><p>한 페이지에 회원 1명을 표시합니다.</p><p>선택 '+esc(ids.length)+'명</p><ul>'+ids.map(id=>'<li>'+esc(id)+button(s,'선택 제거','recipient-remove','data-id="'+esc(id)+'"')+'</li>').join('')+'</ul>'+button(s,'선택 모두 지우기','recipients-clear')+'</section>';
+}
 function composeHTML(s){
- const primary=s.account?.bundle?.primary;
+ const primary=s.account?.bundle?.primary,d=s.draft||{};
  if(!primary)return '<p class="notice">계정에 저장한 전체 개인 자료가 없습니다. 전체 개인 자료 화면에서 계정 저장을 먼저 검토해 주세요.</p>';
- const trips=primary.trips.filter(t=>t.payload.planBase);
- return '<form id="social-account-compose"><p>계정에 저장한 시점의 원본입니다. 현재 기기의 미저장 편집은 포함하지 않습니다.</p><label class="field">공유할 계정 원본<select class="select" name="source">'+trips.map(t=>'<option value="trip:'+esc(t.id)+'">여행 · '+esc(t.payload.title)+'</option>').join('')+(primary.places.places.length?'<option value="place:saved-places">저장 장소</option>':'')+'</select></label>'+(!trips.length?'<p>공유 가능한 명시 일정이 없습니다. 저장 장소를 선택하거나 계정 일정 저장을 먼저 확인하세요.</p>':'')+'<label class="field">여행 날짜 번호 · 쉼표 구분, 비우면 전체<input class="input" name="days" placeholder="1, 2"></label><label class="field">저장 장소 ID · 쉼표 구분, 비우면 전체<input class="input" name="placeIds"></label><details><summary>원본 날짜·장소 ID 확인</summary>'+trips.map(t=>'<p>'+esc(t.payload.title)+' · 날짜 '+Object.keys(t.payload.planBase).map(esc).join(', ')+'</p>').join('')+'<ul>'+primary.places.places.map(p=>'<li>'+esc(p.name)+' · '+esc(p.id)+'</li>').join('')+'</ul></details><label class="field">새로 작성할 공유 설명<textarea class="input" name="description"></textarea></label><label class="field">대상<select class="select" name="audience"><option value="INVITED_MEMBERS">발행 시 활성 초대 회원 전체 · 서버 정책 필요</option><option value="DESIGNATED">이미 알고 있는 회원 ID 지정 · 임시 입력</option></select></label><label class="field">알고 있는 회원 opaque ID · 쉼표 구분<input class="input" name="members" autocomplete="off"></label><p>회원 이름·메일 검색과 명부 선택은 아직 준비되지 않았습니다. 입력한 ID의 자격은 서버가 검사하며 가입 여부를 추정하지 않습니다.</p>'+button(s,'미리보기 요청만 기기에 준비','prepare-preview')+'</form>';
+ const trips=primary.trips.filter(t=>t.payload.planBase),option=(value,label)=>'<option value="'+esc(value)+'" '+(d.source===value?'selected':'')+'>'+esc(label)+'</option>',input=(name,label)=>'<label class="field">'+label+'<input class="input" name="'+name+'" value="'+esc(d[name]||'')+'"></label>';
+ return '<form id="social-account-compose"><fieldset style="border:0;padding:0;margin:0" '+(s.working?'disabled':'')+'><p>계정에 저장한 시점의 원본입니다. 현재 기기의 미저장 편집은 포함하지 않습니다.</p><label class="field">공유할 계정 원본<select class="select" name="source">'+trips.map(t=>option('trip:'+t.id,'여행 · '+t.payload.title)).join('')+(primary.places.places.length?option('place:saved-places','저장 장소'):'')+'</select></label>'+(!trips.length?'<p>공유 가능한 명시 일정이 없습니다. 저장 장소를 선택하거나 계정 일정 저장을 먼저 확인하세요.</p>':'')+input('days','여행 날짜 번호 · 쉼표 구분, 비우면 전체')+input('placeIds','저장 장소 ID · 쉼표 구분, 비우면 전체')+'<details><summary>원본 날짜·장소 ID 확인</summary>'+trips.map(t=>'<p>'+esc(t.payload.title)+' · 날짜 '+Object.keys(t.payload.planBase).map(esc).join(', ')+'</p>').join('')+'<ul>'+primary.places.places.map(p=>'<li>'+esc(p.name)+' · '+esc(p.id)+'</li>').join('')+'</ul></details><label class="field">새로 작성할 공유 설명<textarea class="input" name="description">'+esc(d.description||'')+'</textarea></label><label class="field">대상<select class="select" name="audience"><option value="INVITED_MEMBERS" '+(d.audience!=='DESIGNATED'?'selected':'')+'>발행 시 활성 초대 회원 전체 · 서버 정책 필요</option><option value="DESIGNATED" '+(d.audience==='DESIGNATED'?'selected':'')+'>서버 회원 목록에서 지정</option></select></label>'+recipientHTML(s)+button(s,'미리보기 요청만 기기에 준비','prepare-preview')+'</fieldset></form>';
 }
 function render(s){
  if(!valid(s))return;
@@ -7600,10 +7648,10 @@ function render(s){
 async function readNotifications(s,cursor=null){
  const observation=++badgeObservation;badge=null;badgeError=false;afterRender();
  s.detail=null;s.compose=false;s.shares=null;s.notifications=null;render(s);
- try{s.notifications=await step(s,()=>s.client.listNotifications({filter:'all',cursor,limit:10}));if(observation===badgeObservation){badge=s.notifications.count;badgeError=false;afterRender();}}
+ try{s.notifications=await step(s,()=>s.client.listNotifications({filter:'all',cursor,limit:PAGE_SIZE}));if(observation===badgeObservation){badge=s.notifications.count;badgeError=false;afterRender();}}
  catch(error){if(valid(s)&&observation===badgeObservation){badge=null;badgeError=true;afterRender();}throw error;}
 }
-async function readShares(s,filter,cursor=null){s.detail=null;s.compose=false;s.notifications=null;s.shares=null;s.filter=filter;render(s);s.shares=await step(s,()=>s.client.listShares({filter,cursor,limit:10}));}
+async function readShares(s,filter,cursor=null){s.detail=null;s.compose=false;s.notifications=null;s.shares=null;s.filter=filter;render(s);s.shares=await step(s,()=>s.client.listShares({filter,cursor,limit:PAGE_SIZE}));}
 async function refreshPending(s){s.readyCurrent=false;s.pending=await step(s,()=>s.flow.local());}
 function requireEmpty(s){if(s.pending&&s.pending.status!=='empty')throw Error('social-operation-pending');}
 async function prepare(s,command){requireEmpty(s);s.pending=await step(s,()=>s.flow.prepare({schemaVersion:1,requestId:crypto.randomUUID(),command}));s.compose=false;s.notice='전송하지 않은 요청을 기기에 보관했습니다. 별도 전송 버튼으로 요청합니다.';}
@@ -7612,13 +7660,21 @@ async function action(s,name,target){
  if(!s.initialized)throw Error('social-unavailable');
  if(name==='notifications'||name==='notifications-next'){await readNotifications(s,name==='notifications-next'?s.notifications?.nextCursor:null);return;}
  if(['mine','received','feed'].includes(name)||name==='shares-next'){await readShares(s,name==='shares-next'?s.filter:name,name==='shares-next'?s.shares?.nextCursor:null);return;}
- if(name==='compose'){requireEmpty(s);s.detail=null;s.notifications=null;s.shares=null;s.compose=false;s.account=await step(s,()=>s.session.getPersonal());s.compose=true;return;}
+ if(name==='compose'){requireEmpty(s);s.draft=null;s.recipientPage=null;s.recipientIds=[];s.recipientKnown=new Set();s.recipientError=false;s.detail=null;s.notifications=null;s.shares=null;s.compose=false;s.account=await step(s,()=>s.session.getPersonal());s.compose=true;return;}
+ if(name==='recipients-search'||name==='recipients-next'){
+  const query=s.draft?.recipientQuery||'',cursor=name==='recipients-next'?s.recipientPage?.nextCursor:null;if(name==='recipients-next'&&(!cursor||s.recipientPage.query!==query))throw Error('selection-invalid');
+  s.recipientPage=null;s.recipientError=false;
+  try{const page=await step(s,()=>s.client.listRecipients({query,cursor,limit:PAGE_SIZE}));s.recipientPage=page;s.recipientLimit=page.selectionLimit;for(const x of page.items)s.recipientKnown.add(x.memberId);if(s.recipientIds.length>page.selectionLimit)s.recipientIds=[];}catch(error){check(s);s.recipientPage=null;s.recipientIds=[];s.recipientKnown.clear();s.recipientError=true;}return;
+ }
+ if(name==='recipient-toggle'||name==='recipient-remove'||name==='recipients-clear'){
+  if(name==='recipients-clear'){s.recipientIds=[];return;}const id=target.dataset.id;if(name==='recipient-remove'){s.recipientIds=s.recipientIds.filter(x=>x!==id);return;}if(!s.recipientPage?.items.some(x=>x.memberId===id)||!s.recipientKnown.has(id))throw Error('selection-invalid');if(s.recipientIds.includes(id))s.recipientIds=s.recipientIds.filter(x=>x!==id);else if(s.recipientIds.length<s.recipientLimit)s.recipientIds.push(id);else s.notice='서버 정책의 지정 회원 한도에 도달했습니다.';return;
+ }
  if(name==='prepare-preview'){
   requireEmpty(s);const fields=target.formValues;if(!fields||!s.account?.bundle)throw Error('source-missing');
   const choice=fields.source,kind=choice.startsWith('trip:')?'trip':choice==='place:saved-places'?'place':null;
   const source=kind==='trip'?s.account.bundle.primary.trips.find(t=>'trip:'+t.id===choice):kind==='place'?s.account.bundle.primary.places:null;
   if(!source)throw Error('source-missing');
-  const command={schemaVersion:1,type:'share-preview',source:{kind,id:kind==='trip'?source.id:'saved-places',revision:source.revision,hash:await step(s,()=>PersonalBackup.digest(source))},expectedAccountRevision:s.account.revision,selection:{days:kind==='trip'?selection(fields.days,true):null,placeIds:kind==='place'?selection(fields.placeIds):null,description:fields.description},audience:fields.audience==='DESIGNATED'?{mode:'DESIGNATED',memberIds:selection(fields.members)||[]}:{mode:'INVITED_MEMBERS'}};
+  const command={schemaVersion:1,type:'share-preview',source:{kind,id:kind==='trip'?source.id:'saved-places',revision:source.revision,hash:await step(s,()=>PersonalBackup.digest(source))},expectedAccountRevision:s.account.revision,selection:{days:kind==='trip'?selection(fields.days,true):null,placeIds:kind==='place'?selection(fields.placeIds):null,description:fields.description},audience:fields.audience==='DESIGNATED'?{mode:'DESIGNATED',memberIds:(target.memberIds||[])}:{mode:'INVITED_MEMBERS'}};
   await prepare(s,command);return;
  }
  if(name==='notice'||name==='detail'){
@@ -7672,13 +7728,22 @@ async function open(session,view='notifications'){
   if(view==='notifications')await readNotifications(s);else await readShares(s,view==='shares'?'mine':['mine','received','feed'].includes(view)?view:'received');
  });
 }
+function captureDraft(s){
+ const form=s.compose&&document.querySelector('#social-account-compose');
+ if(form)s.draft=Object.fromEntries(['source','days','placeIds','description','audience','recipientQuery'].map(k=>[k,form.elements[k]?.value??s.draft?.[k]??'']));
+ return form;
+}
+document.addEventListener('input',event=>{
+ const s=current;if(!s||!valid(s)||s.working||!s.compose||event.target.name!=='recipientQuery'||event.target.closest('#social-account-compose')!==document.querySelector('#social-account-compose'))return;
+ captureDraft(s);s.recipientPage=null;s.recipientError=false;
+ // Update only candidates so typing keeps focus and the captured form draft.
+ const results=document.querySelector('#social-account-recipient-results');if(results)results.innerHTML='<p>검색 조건이 바뀌었습니다. 회원 조회를 눌러 주세요. 기존 선택은 유지합니다.</p>';
+});
 document.addEventListener('click',event=>{
- const target=event.target.closest('[data-social-account]'),s=current;if(!target||!s)return;event.preventDefault();
+ const target=event.target.closest('[data-social-account]'),s=current;if(!target||!s)return;event.preventDefault();if(s.working)return;
  const captured={dataset:{...target.dataset}};
- if(target.dataset.socialAccount==='prepare-preview'){
-  const form=document.querySelector('#social-account-compose');
-  if(form)captured.formValues=Object.fromEntries(['source','days','placeIds','description','audience','members'].map(k=>[k,form.elements[k].value]));
- }
+ if(captureDraft(s))captured.formValues={...s.draft};
+ if(target.dataset.socialAccount==='prepare-preview'){captured.memberIds=[...(s.recipientIds||[])];if(captured.memberIds.some(id=>!s.recipientKnown?.has(id))||captured.memberIds.length>(s.recipientLimit||0))return;}
  void run(s,()=>action(s,captured.dataset.socialAccount,captured));
 });
 document.querySelector('#dialog')?.addEventListener('cancel',event=>{if(current?.working)event.preventDefault();});
@@ -7690,8 +7755,9 @@ root.ServerSocialAccountUI={open,configure,afterRender,isAccountMode:()=>configu
 const settings=TripCloud.config(window.TRIP_CLOUD_CONFIG),esc=escapeText;
 let pendingGuest=false,operationFlow=null,operationShown=null;
 let session=null,busy=false,notice='',failed=false,filter='all',dialogOpen=false;
+let storageSummary=null,storageState='unqueried',storageObservation=0;
 const host=document.createElement('section');host.id='cloud-storage';host.className='cloud-storage';host.setAttribute('aria-label','계정 여행 저장');document.querySelector('#main').before(host);
-function paint(){const user=session?.user();host.innerHTML=`<div class="cloud-copy"><b>☁ ${user?'내 계정 여행':'기기를 바꿔도, 이어지는 여행'}</b><span>${esc(notice||(user?'편집은 기기에 자동 저장돼요. 다른 기기에서 열기 전 계정에 저장해 주세요.':settings.enabled?'로그인하면 다른 기기에서 저장한 여행을 불러올 수 있어요.':'계정 저장 연결 준비 중 · 현재 편집은 이 브라우저에 자동 저장돼요.'))}</span></div><div class="row wrap"><button class="btn small" data-cloud="save" ${busy?'disabled':''}>계정에 저장</button><button class="btn small primary" data-cloud="open" ${busy?'disabled':''}>${user?'계정 보관함':'로그인 · 계정 보관함'}</button><button class="btn small" data-cloud="personal-open" ${busy?'disabled':''}>전체 개인 자료</button><button class="btn small" data-cloud="itinerary-open" ${busy?'disabled':''}>이 여행 계정 일정</button><button class="btn small" data-cloud="social-open" ${busy?'disabled':''}>계정 공유</button><button class="btn small" data-cloud="notifications-open" ${busy?'disabled':''}>계정 알림</button><button class="btn small" data-cloud="operation-check" ${busy?'disabled':''}>계정 저장 작업 확인</button></div>`;host.classList.toggle('cloud-error',failed);window.ServerSocialAccountUI?.afterRender();}
+function paint(){const user=session?.user();host.innerHTML=`<div class="cloud-copy"><b>☁ ${user?'내 계정 여행':'기기를 바꿔도, 이어지는 여행'}</b><span>${esc(notice||(user?'편집은 기기에 자동 저장돼요. 다른 기기에서 열기 전 계정에 저장해 주세요.':settings.enabled?'로그인하면 다른 기기에서 저장한 여행을 불러올 수 있어요.':'계정 저장 연결 준비 중 · 현재 편집은 이 브라우저에 자동 저장돼요.'))}</span></div><div class="row wrap"><button class="btn small" data-cloud="save" ${busy?'disabled':''}>계정에 저장</button><button class="btn small primary" data-cloud="open" ${busy?'disabled':''}>${user?'계정 보관함':'로그인 · 계정 보관함'}</button><button class="btn small" data-cloud="personal-open" ${busy?'disabled':''}>전체 개인 자료</button><button class="btn small" data-cloud="itinerary-open" ${busy?'disabled':''}>이 여행 계정 일정</button><button class="btn small" data-cloud="social-open" ${busy?'disabled':''}>계정 공유</button><button class="btn small" data-cloud="notifications-open" ${busy?'disabled':''}>계정 알림</button><button class="btn small" data-cloud="operation-check" ${busy?'disabled':''}>계정 저장 작업 확인</button></div>${limits()}`;document.querySelectorAll('#dialog-body [data-cloud-storage-status]').forEach(el=>{el.textContent=storageMessage();});host.classList.toggle('cloud-error',failed);window.ServerSocialAccountUI?.afterRender();}
 function errorText(e){
  if(/enhanced-personal-required/.test(e.message))return '이 여행의 설정과 이전 확인본을 보존하려면 전체 개인 자료 화면이 필요해요. 현재 편집은 기기에 유지됩니다. 화면을 새로 연 뒤 전체 개인 자료에서 계정 저장을 검토해 주세요.';
  if(/legacy-retirement/.test(e.message))return '이전 저장 방식의 종료를 확인하지 못했어요. 저장 후보와 작업 기록은 유지됩니다. 결과를 다시 확인해 주세요.';
@@ -7706,7 +7772,17 @@ function errorText(e){
 }
 function feedback(text,isError=false){notice=text;failed=isError;paint();const el=document.querySelector('#cloud-feedback');if(el)el.textContent=text;}
 function modal(body){dialogOpen=true;openDialog('계정 보관함',body+'<p id="cloud-feedback" role="status" class="small cloud-feedback"></p>',btn('닫기','close'));}
-function limits(){return '<p class="small muted">계정당 여행 최대 50개 · 일정·메모 합계 2MiB · 여행당 100KiB. 이전 버전은 최근 3개씩, 계정 전체 1MiB 안에서 보관해요. 즐겨찾기·다녀온 여행도 같은 한도를 사용해요.</p>';}
+function storageMessage(){return storageSummary!==null?storageSummary:!settings.enabled?'계정 저장 연결 준비 중 · 정책·사용량을 아직 조회하지 않았습니다.':!session?.user()?'로그인 후 계정 정책·사용량을 확인해 주세요. 아직 조회하지 않았습니다.':storageState==='pending'?'계정 정책·사용량을 확인하고 있습니다.':storageState==='error'?'계정 정책·사용량을 확인하지 못했습니다. 다시 조회해 주세요.':'계정 정책·사용량을 아직 조회하지 않았습니다.';}
+function limits(){return '<p class="small muted" data-cloud-storage-status role="status">'+esc(storageMessage())+'</p>'+(session?.user()?'<button type="button" class="btn small" data-cloud="storage-status" '+(busy?'disabled':'')+'>계정 정책·사용량 확인</button>':'');}
+async function refreshStorage(){
+ if(!session?.user()){await open();return;}
+ const captured=session,auth=captured.guard(),owner=captured.user().id,scope=captured.scope(),observation=++storageObservation;
+ const current=()=>{try{auth();return captured===session&&observation===storageObservation&&captured.user()?.id===owner&&captured.scope()===scope&&TripUI.accountScope()===scope&&!TripUI.isLocked();}catch{return false;}};
+ if(!current())return;storageSummary=null;storageState='pending';paint();
+ try{const value=await window.PersonalAccountStorage.read(captured);if(!current())return;const summary=window.PersonalAccountStorage.summary(value);if(!current())return;storageSummary=summary;storageState='ready';}
+ catch{if(!current())return;storageSummary=null;storageState='error';}
+ if(current())paint();
+}
 async function openSocial(view='notifications'){
  if(!settings.enabled||!session?.user()){await open();return;}
  if(window.ServerItineraryAccountUI?.isBusy()||window.PersonalCloudUI?.isBusy()||window.ItineraryUI?.isBusy())throw Error('account-ui-busy');
@@ -7725,7 +7801,7 @@ async function open(){
  const user=session.user();
  if(!user){modal(`<p class="muted">초대받은 계정으로 로그인해 주세요. 계정 여행과 이 기기에만 저장한 여행은 따로 보관돼요.</p><form id="cloud-login" class="trip-edit"><label class="field">이메일<input class="input" name="email" type="email" autocomplete="username" required maxlength="254"></label><label class="field">비밀번호<input class="input" name="password" type="password" autocomplete="current-password" required maxlength="256"></label><button class="btn primary" type="submit">로그인</button><p class="small muted">이 탭을 새로 열거나 새로고침하면 다시 로그인해 주세요. 계정이 없거나 비밀번호를 잊었다면 관리자에게 문의해 주세요.</p></form>${limits()}`);return;}
  const pending=await operationInfo();if(pending.info){recovery(pending.info,pending.lookupFailed);return;}const check=accountCheck();if(window.PersonalCloudUI&&await window.PersonalCloudUI.shouldUsePersonal(session)){check();await window.PersonalCloudUI.open(session);return;}check();const rows=await session.list();const visible=rows.filter(r=>filter==='all'||filter==='favorites'&&r.favorite===true||filter==='completed'&&r.completed===true);
- modal(`<div class="cloud-account"><div><b>${esc(user.email||'내 계정')}</b><p class="small muted">계정에 저장한 여행을 다른 기기에서도 불러올 수 있어요.</p></div><button class="text-btn" data-cloud="logout">로그아웃</button></div><div class="row wrap cloud-tools"><button class="btn primary" data-cloud="save">현재 여행을 계정에 저장</button><button class="btn" data-cloud="guest">기기에만 있던 여행 가져오기</button><button class="text-btn" data-cloud="open">목록 새로고침</button></div><div class="filters">${[['all','전체'],['favorites','즐겨찾기'],['completed','다녀온 여행']].map(([id,label])=>`<button class="chip ${filter===id?'active':''}" data-cloud="filter" data-filter="${id}">${label}</button>`).join('')}</div><div class="trip-library">${visible.map(r=>`<article class="saved-trip"><div><h3>${esc(r.title)}</h3><p class="small muted">${r.favorite?'★ 즐겨찾기 · ':''}${r.completed?'다녀온 여행':'계획 중'} · ${new Date(r.updated_at).toLocaleString('ko-KR')} · 계정 v${r.revision}</p></div><div class="row wrap"><button class="btn" data-cloud="load" data-id="${esc(r.id)}">불러오기</button><button class="text-btn small" data-cloud="history" data-id="${esc(r.id)}">이전 버전</button></div></article>`).join('')||'<p class="notice">이 분류에 저장한 여행이 없어요. 현재 여행을 계정에 저장해 보세요.</p>'}</div><details class="storage-details"><summary>계정 저장 공간과 편집 충돌 안내</summary><p>여행 ${rows.length}/50개 · ${(rows.reduce((sum,r)=>sum+r.bytes,0)/1048576).toFixed(2)}/2MiB</p>${limits()}<p class="small muted">불러오면 이 기기의 계정 보관 공간에 편집 사본이 생겨요. 수정 후 ‘계정에 저장’을 눌러 반영해 주세요. 다른 기기가 먼저 저장하면 덮어쓰기를 멈춥니다. 현재 편집을 별도 여행으로 보관할 수도 있어요.</p><button class="btn" data-cloud="export">계정 여행 전체 JSON 백업</button><button class="btn" data-cloud="fork">현재 편집을 새 계정 여행으로 저장</button><p class="small muted">로그아웃하면 계정 여행은 화면에서 숨겨집니다. 공유 기기에 남는 편집 사본은 브라우저 데이터 삭제 전까지 디스크에 보관됩니다.</p></details>`);
+ modal(`<div class="cloud-account"><div><b>${esc(user.email||'내 계정')}</b><p class="small muted">계정에 저장한 여행을 다른 기기에서도 불러올 수 있어요.</p></div><button class="text-btn" data-cloud="logout">로그아웃</button></div><div class="row wrap cloud-tools"><button class="btn primary" data-cloud="save">현재 여행을 계정에 저장</button><button class="btn" data-cloud="guest">기기에만 있던 여행 가져오기</button><button class="text-btn" data-cloud="open">목록 새로고침</button></div><div class="filters">${[['all','전체'],['favorites','즐겨찾기'],['completed','다녀온 여행']].map(([id,label])=>`<button class="chip ${filter===id?'active':''}" data-cloud="filter" data-filter="${id}">${label}</button>`).join('')}</div><div class="trip-library">${visible.map(r=>`<article class="saved-trip"><div><h3>${esc(r.title)}</h3><p class="small muted">${r.favorite?'★ 즐겨찾기 · ':''}${r.completed?'다녀온 여행':'계획 중'} · ${new Date(r.updated_at).toLocaleString('ko-KR')} · 계정 v${r.revision}</p></div><div class="row wrap"><button class="btn" data-cloud="load" data-id="${esc(r.id)}">불러오기</button><button class="text-btn small" data-cloud="history" data-id="${esc(r.id)}">이전 버전</button></div></article>`).join('')||'<p class="notice">이 분류에 저장한 여행이 없어요. 현재 여행을 계정에 저장해 보세요.</p>'}</div><details class="storage-details"><summary>계정 저장 공간과 편집 충돌 안내</summary>${limits()}<p class="small muted">불러오면 이 기기의 계정 보관 공간에 편집 사본이 생겨요. 수정 후 ‘계정에 저장’을 눌러 반영해 주세요. 다른 기기가 먼저 저장하면 덮어쓰기를 멈춥니다. 현재 편집을 별도 여행으로 보관할 수도 있어요.</p><button class="btn" data-cloud="export">계정 여행 전체 JSON 백업</button><button class="btn" data-cloud="fork">현재 편집을 새 계정 여행으로 저장</button><p class="small muted">로그아웃하면 계정 여행은 화면에서 숨겨집니다. 공유 기기에 남는 편집 사본은 브라우저 데이터 삭제 전까지 디스크에 보관됩니다.</p></details>`);
 }
 
 function operationButton(label,action){return '<button type="button" class="btn" data-cloud="'+esc(action)+'">'+esc(label)+'</button>';}
@@ -7805,11 +7881,11 @@ async function logout(){
  feedback(authText+' '+storageText,!!(authError||storageError));
 }
 async function run(fn){if(busy||window.ServerSocialAccountUI?.isBusy())return;window.ServerSocialAccountUI?.cancelPending();busy=true;paint();const roots=['#main','#trip-storage','#dialog-body'].map(s=>document.querySelector(s));roots.forEach(el=>{if(el)el.inert=true;});try{await fn();}catch(e){feedback(errorText(e),true);toast(errorText(e));}finally{busy=false;roots.forEach(el=>{if(el)el.inert=TripUI.isLocked()&&el!==document.querySelector('#dialog-body');});paint();if(pendingGuest){pendingGuest=false;await run(()=>TripUI.switchAccount(null));}}}
-document.addEventListener('click',event=>{const el=event.target.closest('[data-cloud]');if(!el||el.dataset.cloud==='restore')return;event.preventDefault();void run(async()=>{if(el.dataset.cloud.startsWith('operation-')){if(!session?.user()){await open();return;}await operationAction(el.dataset.cloud);return;}switch(el.dataset.cloud){case'social-open':await openSocial('shares');break;case'notifications-open':await openSocial('notifications');break;case'itinerary-open':await openItinerary();break;case'personal-open':if(session?.user())await window.PersonalCloudUI.open(session);else await open();break;case'open':await open();break;case'save':await saveCurrent();break;case'filter':filter=el.dataset.filter;await open();break;case'load':{const r=await session.get(el.dataset.id);await TripUI.importCloud(r);feedback('계정 여행을 불러왔어요. 변경한 내용은 ‘계정에 저장’으로 반영해 주세요.');break;}case'guest':await guest();break;case'import':await TripUI.importGuest(el.dataset.id);await saveCurrent();break;case'fork':{const r=await TripUI.checkpoint();await TripUI.importCopy({...r.payload,title:r.payload.title.slice(0,112)+' · 사본'});await saveCurrent();break;}case'export':{const payloads=await session.exportTrips();if(!payloads.length){feedback('백업할 계정 여행이 없어요.');break;}await TripUI.exportFile(payloads,'travel-account-backup.json');feedback('계정에 저장된 여행의 백업 다운로드를 요청했어요. 아직 계정에 저장하지 않은 편집은 현재 편집 백업을 이용해 주세요.');break;}case'history':await history(el.dataset.id);break;case'logout':await logout();break;}});});
-document.addEventListener('submit',event=>{if(event.target.id!=='cloud-login')return;event.preventDefault();const form=event.target,email=form.elements.email.value.trim(),password=form.elements.password.value;form.elements.password.value='';void run(async()=>{await session.signIn(email,password);try{await TripUI.switchAccount(session.scope(),session.guard());}catch(e){await session.signOut();throw e;}feedback('로그인했어요. 계정 여행을 불러오거나 기기에만 있던 여행을 가져오세요.');await open();});});
+document.addEventListener('click',event=>{const el=event.target.closest('[data-cloud]');if(!el||el.dataset.cloud==='restore')return;event.preventDefault();void run(async()=>{if(el.dataset.cloud.startsWith('operation-')){if(!session?.user()){await open();return;}await operationAction(el.dataset.cloud);return;}switch(el.dataset.cloud){case'storage-status':await refreshStorage();break;case'social-open':await openSocial('shares');break;case'notifications-open':await openSocial('notifications');break;case'itinerary-open':await openItinerary();break;case'personal-open':if(session?.user())await window.PersonalCloudUI.open(session);else await open();break;case'open':await open();break;case'save':await saveCurrent();break;case'filter':filter=el.dataset.filter;await open();break;case'load':{const r=await session.get(el.dataset.id);await TripUI.importCloud(r);feedback('계정 여행을 불러왔어요. 변경한 내용은 ‘계정에 저장’으로 반영해 주세요.');break;}case'guest':await guest();break;case'import':await TripUI.importGuest(el.dataset.id);await saveCurrent();break;case'fork':{const r=await TripUI.checkpoint();await TripUI.importCopy({...r.payload,title:r.payload.title.slice(0,112)+' · 사본'});await saveCurrent();break;}case'export':{const payloads=await session.exportTrips();if(!payloads.length){feedback('백업할 계정 여행이 없어요.');break;}await TripUI.exportFile(payloads,'travel-account-backup.json');feedback('계정에 저장된 여행의 백업 다운로드를 요청했어요. 아직 계정에 저장하지 않은 편집은 현재 편집 백업을 이용해 주세요.');break;}case'history':await history(el.dataset.id);break;case'logout':await logout();break;}});});
+document.addEventListener('submit',event=>{if(event.target.id!=='cloud-login')return;event.preventDefault();const form=event.target,email=form.elements.email.value.trim(),password=form.elements.password.value;form.elements.password.value='';void run(async()=>{await session.signIn(email,password);try{await TripUI.switchAccount(session.scope(),session.guard());}catch(e){await session.signOut();throw e;}feedback('로그인했어요. 계정 여행을 불러오거나 기기에만 있던 여행을 가져오세요.');await refreshStorage();await open();});});
 if(settings.enabled){
  const client=supabase.createClient(settings.url,settings.publishableKey,{db:{retry:false},auth:{persistSession:false,autoRefreshToken:true,detectSessionInUrl:false},global:{fetch:(url,options={})=>{const timeout=AbortSignal.timeout(15000);return fetch(url,{...options,signal:options.signal?AbortSignal.any([options.signal,timeout]):timeout});}}});
- session=TripCloud.createSession(client,settings.url,user=>{window.ServerSocialAccountUI?.configure(session,settings.enabled);operationFlow=null;operationShown=null;if(user)pendingGuest=false;if(!user){notice='다시 로그인해 계정 저장 상태를 확인해 주세요.';TripUI.lockAccount();pendingGuest=true;if(!busy){pendingGuest=false;void run(()=>TripUI.switchAccount(null));}}paint();});
+ session=TripCloud.createSession(client,settings.url,user=>{storageObservation++;storageSummary=null;storageState='unqueried';window.ServerSocialAccountUI?.configure(session,settings.enabled);operationFlow=null;operationShown=null;if(user)pendingGuest=false;if(!user){notice='다시 로그인해 계정 저장 상태를 확인해 주세요.';TripUI.lockAccount();pendingGuest=true;if(!busy){pendingGuest=false;void run(()=>TripUI.switchAccount(null));}}paint();});
 }
 window.ServerSocialAccountUI?.configure(session,settings.enabled);
 window.TripCloudUI={openSocial:(view='notifications')=>run(()=>openSocial(view)),open:()=>run(open),openItinerary:()=>run(openItinerary),edited(){notice=session?.user()?'기기에 편집 중 · 다른 기기에서 열기 전 계정에 저장해 주세요.':'';failed=false;paint();}};
