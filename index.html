@@ -171,7 +171,57 @@ function createCallbackFlow(options={}){
  }
  return {confirm,setPassword,signIn,cancel,state,whenCleaned:()=>cleaned};
 }
-return {captureCallback,createCallbackFlow};
+function createRecoveryRequestFlow(options={}){
+ const {canonicalURL,createAuth,recovery,assertCurrent=()=>{},onState=()=>{}}=record(options),redirectTo=canonical(canonicalURL).href;
+ let phase='awaiting_email',cleanup='not_started',error=null,attempted=false,dispatched=false,cancelled=false,owned=null,operation=null,cleanupStarted=false,resolveCleaned;
+ const cleaned=new Promise(resolve=>{resolveCleaned=resolve;}),state=()=>({phase,cleanup,error});
+ const emit=()=>{try{onState(state());}catch{}};
+ function current(){if(cancelled)return false;try{assertCurrent();return true;}catch{cancelled=true;phase='cancelled';error='session-changed';emit();return false;}}
+ function synchronous(value){if(value===undefined)return true;try{Promise.prototype.then.call(value,()=>{},()=>{});}catch{}return false;}
+ function ready(){
+  try{const gates=record(recovery);return typeof gates.assertReady==='function'&&typeof gates.assertRequestReady==='function'&&typeof gates.confirmRevocation==='function'&&synchronous(gates.assertReady.call(recovery))&&synchronous(gates.assertRequestReady.call(recovery,Object.freeze({redirectTo})));}catch{return false;}
+ }
+ function fail(code,unknown=false){error=code;phase=unknown?'result_unknown':'failed';emit();}
+ function permitted(){if(!current())return false;if(!ready()){fail('not-configured',dispatched);return false;}return current();}
+ function emptySession(raw){const value=record(raw),data=record(value.data);return value.error===null&&Object.hasOwn(data,'session')&&data.session===null;}
+ async function finish(){
+  if(cleanupStarted)return cleaned;cleanupStarted=true;cleanup='pending';emit();if(operation)try{await operation;}catch{}
+  let failed=false;if(owned){
+   try{if(record(await owned.signOut({scope:'local'})).error!==null)failed=true;}catch{failed=true;}
+   try{await owned.stopAutoRefresh();}catch{failed=true;}
+   try{await owned.dispose();}catch{failed=true;}
+   try{if(!emptySession(await owned.getSession()))failed=true;}catch{failed=true;}
+  }
+  owned=null;cleanup=failed?'failed':'cleaned';if(failed){error='cleanup-failed';if(!cancelled)phase='failed';}else if(!cancelled)current();emit();resolveCleaned({cleanup});return cleaned;
+ }
+ async function request(rawEmail){
+  if(attempted||cancelled||cleanup!=='not_started')return state();attempted=true;
+  let email=typeof rawEmail==='string'?rawEmail.trim():'';
+  operation=Promise.resolve().then(async()=>{
+   if(!email||email.length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){fail('invalid-email');return;}
+   if(!permitted())return;if(typeof createAuth!=='function'){fail('not-configured');return;}
+   let client,auth;try{
+    const storageKey='travel-here-recovery-request:'+globalThis.crypto.randomUUID();client=createAuth({persistSession:false,detectSessionInUrl:false,autoRefreshToken:false,flowType:'implicit',storageKey});auth=client?.auth;
+    const methods=['resetPasswordForEmail','getSession','signOut','stopAutoRefresh','dispose'];
+    if(!client||typeof client!=='object'||!auth||typeof auth!=='object'||usedClients.has(client)||usedClients.has(auth)||methods.some(key=>typeof auth[key]!=='function'))throw Error('invalid-auth-client');
+    usedClients.add(client);usedClients.add(auth);owned=Object.fromEntries(methods.map(key=>[key,auth[key].bind(auth)]));
+   }catch{fail('invalid-auth-client');return;}
+   if(!permitted())return;let session;
+   try{session=await owned.getSession();}catch{fail('invalid-auth-client');return;}
+   if(!permitted())return;try{if(!emptySession(session))throw Error('invalid-auth-client');}catch{fail('invalid-auth-client');return;}
+   phase='sending';emit();if(!permitted())return;let response;
+   try{dispatched=true;response=await owned.resetPasswordForEmail(email,{redirectTo});}catch{if(current())fail('request-result-unknown',true);return;}finally{email=null;}
+   if(!permitted())return;
+   try{const value=record(response);if(Object.keys(value).sort().join(',')!=='data,error'||value.error!==null||Object.keys(record(value.data)).length)throw Error('invalid-response');}catch{fail('request-result-unknown',true);return;}
+   phase='sent';emit();
+  });
+  try{await operation;}catch{if(current())fail('request-result-unknown',true);}finally{email=null;operation=null;}
+  await finish();return state();
+ }
+ function cancel(){if(cleanup==='cleaned'||cleanup==='failed')return;cancelled=true;phase='cancelled';emit();void finish();}
+ return {request,cancel,state,whenCleaned:()=>cleaned};
+}
+return {captureCallback,createCallbackFlow,createRecoveryRequestFlow};
 });
 
 (function(root){
@@ -1654,7 +1704,7 @@ function change(value,action){const data=clean(value);let undo=null;
  else if(action.type==='remove'){const index=data.categories.findIndex(c=>c.id===action.id);if(index<0)throw Error('missing-category');const [category]=data.categories.splice(index,1);const placeIds=Object.keys(data.assignments).filter(k=>data.assignments[k]===action.id);for(const id of placeIds)data.assignments[id]=null;undo={category,index,placeIds,revision:data.revision+1};}
  else if(action.type==='undo'){const token=action.undo;if(!token||token.revision!==data.revision||data.categories.some(c=>c.id===token.category.id))throw Error('undo-stale');data.categories.splice(token.index,0,clone(token.category));for(const id of token.placeIds){if(!data.places.some(p=>p.id===id)||data.assignments[id]!==null)throw Error('undo-stale');data.assignments[id]=token.category.id;}}
  else if(action.type==='assign'){if(!data.places.some(p=>p.id===action.placeId)||action.categoryId!==null&&!data.categories.some(c=>c.id===action.categoryId))throw Error('invalid-assignment');data.assignments[action.placeId]=action.categoryId;}
- else if(action.type==='place-add'||action.type==='place-update'){if(action.place&&typeof action.place==='object'&&'imports' in action.place)throw Error('invalid-place-imports');const p=placeClean({...action.place,mapKey:''}),index=data.places.findIndex(item=>item.id===p.id);if(action.type==='place-add'){if(index>=0)throw Error('invalid-place');if(data.places.length>=500)throw Error('place-limit');data.places.push(p);}else{if(index<0)throw Error('missing-place');const previous=data.places[index];if(previous.imports!==undefined)p.imports=clone(previous.imports);p.priority=action.place.priority||previous.priority;p.mapKey=previous.name===p.name&&previous.sub===p.sub?previous.mapKey:'';if(previous.name!==p.name||previous.sub!==p.sub){delete p.googleMapsUrl;delete p.googlePlaceId;}data.places[index]=p;}if(action.categoryId!==null&&!data.categories.some(c=>c.id===action.categoryId))throw Error('invalid-assignment');data.assignments[p.id]=action.categoryId;}
+ else if(action.type==='place-add'||action.type==='place-update'){if(action.place&&typeof action.place==='object'&&'imports' in action.place)throw Error('invalid-place-imports');const p=placeClean({...action.place,mapKey:''}),index=data.places.findIndex(item=>item.id===p.id);if(action.type==='place-add'){if(index>=0)throw Error('invalid-place');if(data.places.length>=500)throw Error('place-limit');data.places.push(p);}else{if(index<0)throw Error('missing-place');const previous=data.places[index];if(previous.imports!==undefined)p.imports=clone(previous.imports);p.priority=action.place.priority||previous.priority;p.mapKey=previous.name===p.name&&previous.sub===p.sub?previous.mapKey:'';if((previous.name!==p.name||previous.sub!==p.sub)&&action.googleSourceSelected!==true){delete p.googleMapsUrl;delete p.googlePlaceId;}data.places[index]=p;}if(action.categoryId!==null&&!data.categories.some(c=>c.id===action.categoryId))throw Error('invalid-assignment');data.assignments[p.id]=action.categoryId;}
  else if(action.type==='place-remove'){const index=data.places.findIndex(p=>p.id===action.id);if(index<0)throw Error('missing-place');data.places.splice(index,1);delete data.assignments[action.id];}
  else throw Error('invalid-action');data.revision++;return {data:clean(data),undo};
 }
@@ -10755,7 +10805,7 @@ function afterDialog(title){if(title!=='백업 파일 복원 확인'&&!confirmin
 async function act(action,el){if(action==='export-current'){await exportCurrent('travel-current-backup.json');return;}if(!ready)throw Error('storage-unavailable');switch(action){case'new':newTrip();break;case'create':await createTrip();break;case'save':await save();break;case'library':await library();break;case'favorite':metadata.favorite=!metadata.favorite;changed();await queue;await library();break;case'completed':metadata.completed=!metadata.completed;changed();await queue;await library();break;case'filter':filter=el.dataset.filter;await library();break;case'copy':await copy();break;case'load':await load(el.dataset.id);break;case'history':await history();break;case'restore':{const binding=legacyBinding(),data=await latestLegacyData(binding),h=data.history.find(h=>h.id===el.dataset.id&&h.tripId===binding.tripId);if(!h)throw Error('missing-history');await copy(h.record.payload,h.id);break;}case'export-all':{const binding=legacyBinding(),payload=capture(),data=await latestLegacyData(binding),records=[];for(const row of data.trips)records.push(row.id===binding.tripId?await archiveRecord(row,payload,binding):row);await exportRecords(records,'travel-all-backup.json',binding);break;}case'persist':{const ok=await navigator.storage?.persist?.();const status=document.querySelector('#storage-feedback');if(status)status.textContent=ok?'브라우저 보관 보호가 허용됐어요. 직접 데이터 삭제와 기기 분실에는 별도 백업이 필요해요.':'브라우저가 보관 보호를 허용하지 않았어요. 파일 백업을 함께 사용해 주세요.';break;}}}
 document.addEventListener('click',e=>{const el=e.target.closest('[data-trip]');if(el){e.preventDefault();if(transition)return;transition=true;const roots=[document.querySelector('#main'),document.querySelector('#dialog-body')];roots.forEach(n=>n.inert=true);void act(el.dataset.trip,el).catch(error=>{failure=message(error);bar();toast(failure);}).finally(()=>{transition=false;roots.forEach(n=>n.inert=false);});}else{const action=e.target.closest('[data-action]');if(action&&action.dataset.action!=='map-retry')changed();}});
 document.addEventListener('input',e=>{if(e.target.id==='trip-title'){metadata.title=e.target.value;changed();}if(e.target.id==='trip-memo'){metadata.memo=e.target.value;changed();}if(e.target.dataset.condition){conditions[e.target.dataset.condition]=e.target.value;changed();}});
-document.addEventListener('change',e=>{if(e.target.id==='trip-import')void importFile(e.target.files[0]).catch(error=>{if(error.message==='trip-import-changed')return;failure=message(error);bar();toast(failure);});else{if(e.target.dataset.condition)conditions[e.target.dataset.condition]=e.target.value;changed();}});
+document.addEventListener('change',e=>{if(e.target.closest?.('#auth-callback-panel'))return;if(e.target.id==='trip-import')void importFile(e.target.files[0]).catch(error=>{if(error.message==='trip-import-changed')return;failure=message(error);bar();toast(failure);});else{if(e.target.dataset.condition)conditions[e.target.dataset.condition]=e.target.value;changed();}});
 window.addEventListener('beforeunload',e=>{if(dirty||busy||transition||confirmingImport){e.preventDefault();e.returnValue='';}});
 document.addEventListener('click',e=>{if(e.target.closest('[data-action="close"]')){if(creatingTrip||confirmingImport){e.preventDefault();e.stopImmediatePropagation();}else tripImportSequence++;}},{capture:true});
 document.addEventListener('cancel',e=>{if(e.target.id==='dialog'){if(creatingTrip||confirmingImport){e.preventDefault();e.stopImmediatePropagation();}else tripImportSequence++;}},{capture:true});
@@ -11421,6 +11471,7 @@ function canSignIn(root=globalThis){
  const controller=controllers.get(root);return controller?controller.canSignIn():!root.__travelHereAuthCallback;
 }
 function openReceiptRecovery(root=globalThis){return controllers.get(root)?.openReceiptRecovery();}
+function openPasswordRecovery(root=globalThis){return controllers.get(root)?.openPasswordRecovery();}
 function initialize({root=globalThis,settings:configured,createAuth,acceptInvite,recoverAcceptance,recovery,assertCurrent,captureGuard}={}){
  if(controllers.has(root))return controllers.get(root);
  const document=root.document;let handoff=null,hardBlocked=blocked(root);
@@ -11435,12 +11486,20 @@ function initialize({root=globalThis,settings:configured,createAuth,acceptInvite
  try{capture();}catch{hardBlocked=true;}
  const guard=()=>{if(blocked(root)||hardBlocked||root.TripUI!==initialUI||initialUI?.accountScope?.()!==scope||initialUI?.creationMarker?.()!==marker)throw Error('session-changed');productGuard?.();assertCurrent?.();};
  const factory=createAuth||((auth)=>root.supabase.createClient(settings.url,settings.publishableKey,{db:{retry:false},auth}));
- const available=()=>!hardBlocked&&!blocked(root)&&settings.enabled&&(purpose==='receipt'||!!captured)&&scope==null&&(purpose==='receipt'?typeof recoverAcceptance==='function':['invite','service_invite'].includes(purpose)?typeof acceptInvite==='function':typeof recovery?.assertReady==='function'&&typeof recovery?.confirmRevocation==='function')&&(typeof createAuth==='function'||typeof root.supabase?.createClient==='function');
+ const recoveryURL=()=>root.location.origin+root.location.pathname;
+ const synchronousReady=value=>{if(value&&typeof value.then==='function')Promise.resolve(value).catch(()=>{});return value===undefined;};
+ function requestReady(){
+  try{
+   guard();if(!settings.enabled||scope!=null||typeof recovery?.assertReady!=='function'||typeof recovery?.confirmRevocation!=='function'||typeof recovery?.assertRequestReady!=='function')return false;
+   return synchronousReady(recovery.assertReady())&&synchronousReady(recovery.assertRequestReady({redirectTo:recoveryURL()}));
+  }catch{return false;}
+ }
+ const available=()=>!hardBlocked&&!blocked(root)&&settings.enabled&&(purpose==='recovery_request'?requestReady():(purpose==='receipt'||!!captured)&&scope==null&&(purpose==='receipt'?typeof recoverAcceptance==='function':['invite','service_invite'].includes(purpose)?typeof acceptInvite==='function':typeof recovery?.assertReady==='function'&&typeof recovery?.confirmRevocation==='function'))&&(typeof createAuth==='function'||typeof root.supabase?.createClient==='function');
  const safe=()=>{
   if(hardBlocked||blocked(root))return false;
   if(!active)return true;
   if(!flow)return dismissed;
-  const value=flow.state();return cleanedResolved&&value.cleanup==='cleaned'&&['not_required','confirmed'].includes(value.revocation);
+  const value=flow.state();return cleanedResolved&&value.cleanup==='cleaned'&&(purpose==='recovery_request'||['not_required','confirmed'].includes(value.revocation));
  };
  const state=()=>({active:active&&!safe(),blocked:!safe(),flow:flow?flow.state():null});
  function notice(){
@@ -11450,6 +11509,16 @@ function initialize({root=globalThis,settings:configured,createAuth,acceptInvite
   if(value?.revocation==='unknown')return '이전 로그인 연결의 종료를 확인하지 못했어요. 복구 결과가 확인될 때까지 이 화면의 로그인을 멈춥니다.';
   if(value?.cleanup==='failed')return '임시 인증 연결의 종료를 확인하지 못했어요. 이 화면의 로그인을 멈춥니다.';
   if(value?.cleanup==='pending')return '진행 중인 인증 응답과 임시 연결의 종료를 확인하고 있어요. 확인 전에는 로그인하지 않습니다.';
+  if(purpose==='recovery_request'){
+   if(dismissed||value?.phase==='cancelled')return '복구 요청 화면을 닫았어요. 이미 전송한 메일 요청은 취소되지 않을 수 있습니다. 기기 편집은 유지됩니다.';
+   if(value?.phase==='sent')return '복구 메일 요청을 처리했어요. 이 응답은 계정 존재나 실제 메일 수신을 확인한 결과가 아닙니다. 받은 유효한 링크에서 계속해 주세요.';
+   if(value?.phase==='result_unknown')return '복구 메일 요청 결과를 확인하지 못했어요. 이미 전송됐을 수 있어 자동으로 다시 요청하지 않습니다.';
+   if(value?.phase==='sending')return '복구 메일을 요청하고 있어요. 현재 기기의 편집은 유지됩니다.';
+   if(localNotice)return localNotice;
+   if(value?.error==='invalid-email')return '올바른 이메일을 입력해 주세요.';
+   if(value?.error||!flow&&!available())return '비밀번호 복구 연결이 아직 준비되지 않았어요. 메일을 요청하지 않습니다.';
+   return '이메일을 입력하고 복구 메일을 명시적으로 요청해 주세요. 현재 로그인과 기기 편집은 바뀌지 않습니다.';
+  }
   if(dismissed||value?.phase==='cancelled')return safe()?'초대·복구 화면을 닫았어요. 기기의 편집은 유지됩니다.':'인증 처리를 취소하고 연결 종료를 확인하고 있어요.';
   if(localNotice)return localNotice;
   if(value?.phase==='completed')return (purpose==='receipt'?'이 계정의 가입 결과를 확인했어요.':purpose==='service_invite'?'초대 수락을 확인했어요.':'비밀번호 설정을 마쳤어요.')+' 기존 로그인 화면에서 이메일과 비밀번호로 별도로 로그인해 주세요. 회원 권한은 로그인할 때 다시 확인합니다.';
@@ -11467,18 +11536,19 @@ function initialize({root=globalThis,settings:configured,createAuth,acceptInvite
  function render(){
   if(!panel)return;
   const value=flow?.state(),password=value?.phase==='awaiting_password'&&!dismissed&&!hardBlocked&&!blocked(root);
-  let html='<h2>초대·비밀번호 복구</h2><p class="notice" role="status">'+notice()+'</p>';
+  let html='<h2>'+(purpose==='recovery_request'?'비밀번호 복구 메일 요청':'초대·비밀번호 복구')+'</h2><p class="notice" role="status">'+notice()+'</p>';
+  if(purpose==='recovery_request'&&!flow&&!dismissed)html+='<form id="auth-recovery-request" class="trip-edit"><label class="field">이메일<input class="input" name="email" type="email" autocomplete="email" maxlength="254" required></label><button class="btn primary" type="submit"'+(!available()?' disabled':'')+'>복구 메일 요청</button></form>';
   if(password)html+='<form id="auth-callback-password" class="trip-edit"><label class="field">새 비밀번호<input class="input" name="password" type="password" autocomplete="new-password" maxlength="256" required></label><label class="field">새 비밀번호 확인<input class="input" name="repeat" type="password" autocomplete="new-password" maxlength="256" required></label><button class="btn primary" type="submit">비밀번호 설정</button></form>';
   if(value?.phase==='awaiting_credentials'&&!dismissed&&!hardBlocked&&!blocked(root))html+='<form id="auth-callback-credentials" class="trip-edit"><label class="field">이메일<input class="input" name="email" type="email" autocomplete="username" maxlength="254" required></label><label class="field">현재 비밀번호<input class="input" name="password" type="password" autocomplete="current-password" maxlength="256" required></label><button class="btn primary" type="submit">가입 확인</button></form>';
   html+='<div class="row wrap">';
-  if(!flow&&!dismissed&&!invalid)html+=button('링크 확인','confirm',!available());
+  if(purpose!=='recovery_request'&&!flow&&!dismissed&&!invalid)html+=button('링크 확인','confirm',!available());
   if(!safe()||!dismissed&&!value)html+=button('인증 처리 취소','cancel',dismissed);
   if(safe()&&active)html+=button('기존 로그인 화면 열기','login');
   if(invalid||value&&['failed','expired','result_unknown','cancelled'].includes(value.phase))html+=button('가입 결과 확인','receipt-recovery',!canEnterReceipt());
   html+='</div>';panel.innerHTML=html;
  }
  async function confirm(){
-  if(confirming||flow||dismissed||!available()){render();return state();}
+  if(purpose==='recovery_request'||confirming||flow||dismissed||!available()){render();return state();}
   confirming=true;
   try{
    guard();flow=core.createCallbackFlow({...(purpose==='receipt'?{mode:'receipt'}:{callback:captured}),createAuth:factory,acceptInvite,recoverAcceptance,recovery,assertCurrent:guard,onState:render});captured=null;
@@ -11492,10 +11562,29 @@ function initialize({root=globalThis,settings:configured,createAuth,acceptInvite
   localNotice='';try{await flow.signIn(email,password);}catch{hardBlocked=true;}finally{email=null;password=null;}
   render();return state();
  }
+ async function requestRecoveryEmail(email){
+  if(purpose!=='recovery_request'||confirming||flow||dismissed||!available()){email=null;render();return state();}
+  if(typeof email!=='string'||email.trim().length>254||!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())){email=null;localNotice='올바른 이메일을 입력해 주세요.';render();return state();}
+  localNotice='';
+  confirming=true;
+  try{
+   guard();flow=core.createRecoveryRequestFlow({canonicalURL:recoveryURL(),createAuth:factory,recovery,assertCurrent:guard,onState:render});
+   const owned=flow;flow.whenCleaned().then(()=>{if(flow===owned){cleanedResolved=true;render();}},()=>{hardBlocked=true;render();});
+   await flow.request(email);
+  }catch{hardBlocked=true;}
+  finally{email=null;confirming=false;}
+  render();return state();
+ }
  function canEnterReceipt(){return !entering&&!confirming&&!hardBlocked&&!blocked(root)&&root.TripUI?.accountScope?.()==null&&(!flow||safe())&&!(active&&!flow&&!invalid&&!dismissed&&purpose==='receipt');}
  function enterReceipt(){
   if(!canEnterReceipt())return state();entering=true;
   try{capture();guard();if(scope!=null)return state();flow=null;captured=null;invalid=false;dismissed=false;cleanedResolved=false;localNotice='';purpose='receipt';active=true;ensurePanel();render();}
+  catch{hardBlocked=true;render();}finally{entering=false;}
+  return state();
+ }
+ function enterRecoveryRequest(){
+  if(!canEnterReceipt()||active&&!safe())return state();entering=true;
+  try{capture();guard();if(scope!=null)return state();flow=null;captured=null;invalid=false;dismissed=false;cleanedResolved=false;localNotice='';purpose='recovery_request';active=true;ensurePanel();render();}
   catch{hardBlocked=true;render();}finally{entering=false;}
   return state();
  }
@@ -11506,7 +11595,7 @@ function initialize({root=globalThis,settings:configured,createAuth,acceptInvite
   render();return state();
  }
  function cancel(){dismissed=true;captured=null;localNotice='';flow?.cancel();render();return state();}
- const controller={state,canSignIn:safe,confirm,setPassword,signIn,cancel,openReceiptRecovery:enterReceipt};controllers.set(root,controller);
+ const controller={state,canSignIn:safe,confirm,setPassword,signIn,cancel,openReceiptRecovery:enterReceipt,openPasswordRecovery:enterRecoveryRequest,requestRecoveryEmail};controllers.set(root,controller);
  function ensurePanel(){
   if(panel)return;
   const main=document?.querySelector('#main');if(!main||typeof document.createElement!=='function'){hardBlocked=true;return controller;}
@@ -11516,6 +11605,7 @@ function initialize({root=globalThis,settings:configured,createAuth,acceptInvite
    if(action==='confirm')void confirm();else if(action==='cancel')cancel();else if(action==='receipt-recovery')enterReceipt();else if(action==='login'&&safe())try{Promise.resolve(root.TripCloudUI?.open()).catch(()=>{});}catch{}
   });
   panel.addEventListener('submit',event=>{
+   if(event.target.id==='auth-recovery-request'){event.preventDefault();const form=event.target,email=form.elements.email.value;form.elements.email.value='';void requestRecoveryEmail(email);return;}
    if(event.target.id==='auth-callback-credentials'){event.preventDefault();const form=event.target,email=form.elements.email.value,password=form.elements.password.value;form.elements.email.value='';form.elements.password.value='';void signIn(email,password);return;}
    if(event.target.id!=='auth-callback-password')return;event.preventDefault();const form=event.target,password=form.elements.password.value,repeat=form.elements.repeat.value;
    form.elements.password.value='';form.elements.repeat.value='';void setPassword(password,repeat);
@@ -11524,7 +11614,7 @@ function initialize({root=globalThis,settings:configured,createAuth,acceptInvite
  if(hasCallback)ensurePanel();
  return controller;
 }
-return {initialize,canSignIn,openReceiptRecovery};
+return {initialize,canSignIn,openReceiptRecovery,openPasswordRecovery};
 });
 
 (function(){
@@ -11581,9 +11671,9 @@ async function openItinerary(){
  window.PersonalCloudUI?.cancelPending();await window.ServerItineraryAccountUI.open(session);
 }
 async function open(){
- if(!settings.enabled){modal(`<div class="cloud-intro"><span class="cloud-icon">☁</span><h3>어느 기기에서든 내 여행을</h3><p>계정 저장소 연결을 준비하고 있어요.<br>연결 후 로그인하면 여행 계획과 즐겨찾기, 다녀온 여행을 함께 불러올 수 있어요.</p><span class="tag">아직 연결되지 않았어요</span></div><div class="notice">현재 편집은 이 기기에 자동 저장됩니다. 연결 전 다른 기기로 옮길 때는 ‘현재 편집 백업’을 사용해 주세요.</div>${limits()}`);return;}
+ if(!settings.enabled){modal(`<div class="cloud-intro"><span class="cloud-icon">☁</span><h3>어느 기기에서든 내 여행을</h3><p>계정 저장소 연결을 준비하고 있어요.<br>연결 후 로그인하면 여행 계획과 즐겨찾기, 다녀온 여행을 함께 불러올 수 있어요.</p><span class="tag">아직 연결되지 않았어요</span></div><div class="notice">현재 편집은 이 기기에 자동 저장됩니다. 연결 전 다른 기기로 옮길 때는 ‘현재 편집 백업’을 사용해 주세요.</div><button type="button" class="btn" data-cloud="password-recovery">비밀번호 복구 안내</button>${limits()}`);return;}
  const user=session.user();
- if(!user){modal(`<p class="muted">초대받은 계정으로 로그인해 주세요. 계정 여행과 이 기기에만 저장한 여행은 따로 보관돼요.</p><form id="cloud-login" class="trip-edit"><label class="field">이메일<input class="input" name="email" type="email" autocomplete="username" required maxlength="254"></label><label class="field">비밀번호<input class="input" name="password" type="password" autocomplete="current-password" required maxlength="256"></label><button class="btn primary" type="submit">로그인</button><p class="small muted">이 탭을 새로 열거나 새로고침하면 다시 로그인해 주세요. 계정이 없거나 비밀번호를 잊었다면 관리자에게 문의해 주세요.</p></form><button type="button" class="btn" data-cloud="receipt-recovery">가입 결과 확인</button>${limits()}`);return;}
+ if(!user){modal(`<p class="muted">초대받은 계정으로 로그인해 주세요. 계정 여행과 이 기기에만 저장한 여행은 따로 보관돼요.</p><form id="cloud-login" class="trip-edit"><label class="field">이메일<input class="input" name="email" type="email" autocomplete="username" required maxlength="254"></label><label class="field">비밀번호<input class="input" name="password" type="password" autocomplete="current-password" required maxlength="256"></label><button class="btn primary" type="submit">로그인</button><p class="small muted">이 탭을 새로 열거나 새로고침하면 다시 로그인해 주세요. 계정이 없다면 관리자에게 초대를 요청해 주세요.</p></form><button type="button" class="btn" data-cloud="password-recovery">비밀번호 복구</button><button type="button" class="btn" data-cloud="receipt-recovery">가입 결과 확인</button>${limits()}`);return;}
  const pending=await operationInfo();if(pending.info){recovery(pending.info,pending.lookupFailed);return;}const check=accountCheck();if(window.PersonalCloudUI&&await window.PersonalCloudUI.shouldUsePersonal(session)){check();await window.PersonalCloudUI.open(session);return;}check();const rows=await session.list();const visible=rows.filter(r=>filter==='all'||filter==='favorites'&&r.favorite===true||filter==='completed'&&r.completed===true);
  modal(`<div class="cloud-account"><div><b>${esc(user.email||'내 계정')}</b><p class="small muted">계정에 저장한 여행을 다른 기기에서도 불러올 수 있어요.</p></div><button class="text-btn" data-cloud="logout">로그아웃</button></div><div class="row wrap cloud-tools"><button class="btn primary" data-cloud="save">현재 여행을 계정에 저장</button><button class="btn" data-cloud="guest">기기에만 있던 여행 가져오기</button><button class="text-btn" data-cloud="open">목록 새로고침</button></div><div class="filters">${[['all','전체'],['favorites','즐겨찾기'],['completed','다녀온 여행']].map(([id,label])=>`<button class="chip ${filter===id?'active':''}" data-cloud="filter" data-filter="${id}">${label}</button>`).join('')}</div><div class="trip-library">${visible.map(r=>`<article class="saved-trip"><div><h3>${esc(r.title)}</h3><p class="small muted">${r.favorite?'★ 즐겨찾기 · ':''}${r.completed?'다녀온 여행':'계획 중'} · ${new Date(r.updated_at).toLocaleString('ko-KR')} · 계정 v${r.revision}</p></div><div class="row wrap"><button class="btn" data-cloud="load" data-id="${esc(r.id)}">불러오기</button><button class="text-btn small" data-cloud="history" data-id="${esc(r.id)}">이전 버전</button></div></article>`).join('')||'<p class="notice">이 분류에 저장한 여행이 없어요. 현재 여행을 계정에 저장해 보세요.</p>'}</div><details class="storage-details"><summary>계정 저장 공간과 편집 충돌 안내</summary>${limits()}<p class="small muted">불러오면 이 기기의 계정 보관 공간에 편집 사본이 생겨요. 수정 후 ‘계정에 저장’을 눌러 반영해 주세요. 다른 기기가 먼저 저장하면 덮어쓰기를 멈춥니다. 현재 편집을 별도 여행으로 보관할 수도 있어요.</p><button class="btn" data-cloud="export">계정 여행 전체 JSON 백업</button><button class="btn" data-cloud="fork">현재 편집을 새 계정 여행으로 저장</button><p class="small muted">로그아웃하면 계정 여행은 화면에서 숨겨집니다. 공유 기기에 남는 편집 사본은 브라우저 데이터 삭제 전까지 디스크에 보관됩니다.</p></details>`);
 }
@@ -11676,7 +11766,7 @@ async function logout(){
  feedback(authText+' '+storageText,!!(authError||storageError));
 }
 async function run(fn){if(busy||window.ServerSocialAccountUI?.isBusy()||window.CopyErasureUI?.isBusy())return;window.ServerSocialAccountUI?.cancelPending();window.CopyErasureUI?.cancelPending();busy=true;paint();const roots=['#main','#trip-storage','#dialog-body'].map(s=>document.querySelector(s));roots.forEach(el=>{if(el)el.inert=true;});try{await fn();}catch(e){feedback(errorText(e),true);toast(errorText(e));}finally{busy=false;roots.forEach(el=>{if(el)el.inert=TripUI.isLocked()&&el!==document.querySelector('#dialog-body');});paint();if(pendingGuest){pendingGuest=false;await run(()=>TripUI.switchAccount(null));}}}
-document.addEventListener('click',event=>{const el=event.target.closest('[data-cloud]');if(!el||el.dataset.cloud==='restore')return;event.preventDefault();void run(async()=>{if(el.dataset.cloud.startsWith('operation-')){if(!session?.user()){await open();return;}await operationAction(el.dataset.cloud);return;}switch(el.dataset.cloud){case'storage-status':await refreshStorage();break;case'copy-erasure-open':await openCopyErasure();break;case'social-open':await openSocial('shares');break;case'notifications-open':await openSocial('notifications');break;case'itinerary-open':await openItinerary();break;case'personal-open':if(session?.user())await window.PersonalCloudUI.open(session);else await open();break;case'receipt-recovery':if(!session?.user()&&typeof window.AuthCallbackUI?.openReceiptRecovery==='function'){closeDialog();await window.AuthCallbackUI.openReceiptRecovery(window);}break;case'open':await open();break;case'save':await saveCurrent();break;case'filter':filter=el.dataset.filter;await open();break;case'load':{const r=await session.get(el.dataset.id);await TripUI.importCloud(r);feedback('계정 여행을 불러왔어요. 변경한 내용은 ‘계정에 저장’으로 반영해 주세요.');break;}case'guest':await guest();break;case'import':await TripUI.importGuest(el.dataset.id);await saveCurrent();break;case'fork':{const r=await TripUI.checkpoint();await TripUI.importCopy({...r.payload,title:r.payload.title.slice(0,112)+' · 사본'});await saveCurrent();break;}case'export':{const payloads=await session.exportTrips();if(!payloads.length){feedback('백업할 계정 여행이 없어요.');break;}await TripUI.exportFile(payloads,'travel-account-backup.json');feedback('계정에 저장된 여행의 백업 다운로드를 요청했어요. 아직 계정에 저장하지 않은 편집은 현재 편집 백업을 이용해 주세요.');break;}case'history':await history(el.dataset.id);break;case'logout':await logout();break;}});});
+document.addEventListener('click',event=>{const el=event.target.closest('[data-cloud]');if(!el||el.dataset.cloud==='restore')return;event.preventDefault();void run(async()=>{if(el.dataset.cloud.startsWith('operation-')){if(!session?.user()){await open();return;}await operationAction(el.dataset.cloud);return;}switch(el.dataset.cloud){case'storage-status':await refreshStorage();break;case'copy-erasure-open':await openCopyErasure();break;case'social-open':await openSocial('shares');break;case'notifications-open':await openSocial('notifications');break;case'itinerary-open':await openItinerary();break;case'personal-open':if(session?.user())await window.PersonalCloudUI.open(session);else await open();break;case'password-recovery':if(!session?.user()&&typeof window.AuthCallbackUI?.openPasswordRecovery==='function'){closeDialog();await window.AuthCallbackUI.openPasswordRecovery(window);}break;case'receipt-recovery':if(!session?.user()&&typeof window.AuthCallbackUI?.openReceiptRecovery==='function'){closeDialog();await window.AuthCallbackUI.openReceiptRecovery(window);}break;case'open':await open();break;case'save':await saveCurrent();break;case'filter':filter=el.dataset.filter;await open();break;case'load':{const r=await session.get(el.dataset.id);await TripUI.importCloud(r);feedback('계정 여행을 불러왔어요. 변경한 내용은 ‘계정에 저장’으로 반영해 주세요.');break;}case'guest':await guest();break;case'import':await TripUI.importGuest(el.dataset.id);await saveCurrent();break;case'fork':{const r=await TripUI.checkpoint();await TripUI.importCopy({...r.payload,title:r.payload.title.slice(0,112)+' · 사본'});await saveCurrent();break;}case'export':{const payloads=await session.exportTrips();if(!payloads.length){feedback('백업할 계정 여행이 없어요.');break;}await TripUI.exportFile(payloads,'travel-account-backup.json');feedback('계정에 저장된 여행의 백업 다운로드를 요청했어요. 아직 계정에 저장하지 않은 편집은 현재 편집 백업을 이용해 주세요.');break;}case'history':await history(el.dataset.id);break;case'logout':await logout();break;}});});
 function passwordSignInAllowed(){if(window.__travelHereAuthCallbackBlocked||window.__travelHereProductConfigBlocked)return false;return typeof window.AuthCallbackUI?.canSignIn==='function'?window.AuthCallbackUI.canSignIn():!window.__travelHereAuthCallback;}
 document.addEventListener('submit',event=>{if(event.target.id!=='cloud-login')return;event.preventDefault();const form=event.target;if(!passwordSignInAllowed()){form.elements.password.value='';feedback('초대·복구 처리와 임시 연결 종료를 먼저 확인해 주세요. 비밀번호는 전송하지 않았습니다.',true);return;}const email=form.elements.email.value.trim(),password=form.elements.password.value;form.elements.password.value='';void run(async()=>{if(!passwordSignInAllowed()){feedback('초대·복구 처리와 임시 연결 종료를 먼저 확인해 주세요. 비밀번호는 전송하지 않았습니다.',true);return;}await session.signIn(email,password);try{await TripUI.switchAccount(session.scope(),session.guard());}catch(e){await session.signOut();throw e;}feedback('로그인했어요. 계정 여행을 불러오거나 기기에만 있던 여행을 가져오세요.');await refreshStorage();await open();});});
 if(settings.enabled&&!window.__travelHereAuthCallbackBlocked&&!window.__travelHereProductConfigBlocked){
@@ -11731,9 +11821,9 @@ function categoryName(data,id){return data.categories.find(c=>c.id===id)?.name||
 function options(data,selected){return '<option value="">미분류</option>'+data.categories.map(c=>`<option value="${esc(c.id)}" ${c.id===selected?'selected':''}>${esc(c.name)}</option>`).join('');}
 function toolbar(data){const all=data.places,entries=[['all','전체',all.length],...data.categories.map(c=>[c.id,c.name,all.filter(p=>data.assignments[p.id]===c.id).length]),['unfiled','미분류',all.filter(p=>!data.assignments[p.id]).length]];return `<div class="pd-categories" aria-label="저장 장소 카테고리">${entries.map(([id,label,count])=>`<button class="chip ${filter===id?'active':''}" data-pd="filter" data-category="${esc(id)}" aria-pressed="${filter===id}">${esc(label)} <span>${count}</span></button>`).join('')}</div>`;}
 function list(){try{return recommendationContext().saved;}catch{return [];}}
-function openPlaceForm(placeId=null,callbacks={}){const current=read();if(!current.valid)throw Error('invalid-places');const p=placeId===null?{id:crypto.randomUUID(),name:'',sub:'',note:'',type:'unknown',priority:'p2'}:current.data.places.find(p=>p.id===placeId);if(!p)throw Error('missing-place');placeForm?.dispose?.();placeForm={scope:current.scope,revision:current.data.revision,id:p.id,isNew:placeId===null,callbacks,source:{name:p.name,sub:p.sub,googleMapsUrl:p.googleMapsUrl,googlePlaceId:p.googlePlaceId}};openDialog(placeId===null?'새 장소 추가':'저장 장소 수정',`<p class="muted">지도에서 가져오거나 장소명과 위치를 직접 입력해 주세요. 저장 전에 실제 장소와 위치를 확인해 주세요.</p><form id="pd-place-form" class="pd-place-form"><label class="field">장소명<input class="input" name="name" maxlength="120" required value="${esc(p.name)}"></label><label class="field">주소 또는 위치 설명<input class="input" name="sub" maxlength="300" required value="${esc(p.sub)}" placeholder="예: 난바역 3번 출구 앞"></label><label class="field">개인 메모<textarea class="input" name="note" maxlength="1000" rows="3">${esc(p.note)}</textarea></label><div class="pd-form-row"><label class="field">장소 유형<select class="select" name="type">${[['unknown','기타'],['castle','관광'],['food','식당'],['cafe','카페'],['hotel','숙소']].map(([id,label])=>`<option value="${id}" ${p.type===id?'selected':''}>${label}</option>`).join('')}</select></label><label class="field">카테고리<select class="select" name="categoryId">${options(current.data,current.data.assignments[p.id]||null)}</select></label></div><p class="small muted">최대 500곳 · 기존 일정에 담긴 장소는 수정·삭제해도 그대로 남아요. 새 장소는 방문 미확인으로 저장합니다.</p><div class="pd-form-actions"><button class="btn" type="button" data-pd="place-cancel">취소</button><button class="btn primary" type="submit">장소 저장</button></div></form>`,`<button class="text-btn" data-pd="place-cancel">장소 입력 취소</button>`);const intent=placeForm,form=document.querySelector('#pd-place-form');if(placeId===null&&window.GooglePlaceImport&&form){const isCurrent=()=>{if(placeForm!==intent||document.querySelector('#pd-place-form')!==form||scope()!==intent.scope)return false;const latest=read();return latest.valid&&latest.data.revision===intent.revision;};intent.dispose=GooglePlaceImport.mount(form,{isCurrent,fill:value=>{if(!isCurrent())return;form.elements.name.value=value.name;form.elements.sub.value=value.sub;intent.source={...value};}});}}
+function openPlaceForm(placeId=null,callbacks={}){const current=read();if(!current.valid)throw Error('invalid-places');const p=placeId===null?{id:crypto.randomUUID(),name:'',sub:'',note:'',type:'unknown',priority:'p2'}:current.data.places.find(p=>p.id===placeId);if(!p)throw Error('missing-place');placeForm?.dispose?.();placeForm={scope:current.scope,revision:current.data.revision,id:p.id,isNew:placeId===null,callbacks,source:{name:p.name,sub:p.sub,googleMapsUrl:p.googleMapsUrl,googlePlaceId:p.googlePlaceId}};openDialog(placeId===null?'새 장소 추가':'저장 장소 수정',`<p class="muted">지도에서 가져오거나 장소명과 위치를 직접 입력해 주세요. 저장 전에 실제 장소와 위치를 확인해 주세요.</p><form id="pd-place-form" class="pd-place-form"><label class="field">장소명<input class="input" name="name" maxlength="120" required value="${esc(p.name)}"></label><label class="field">주소 또는 위치 설명<input class="input" name="sub" maxlength="300" required value="${esc(p.sub)}" placeholder="예: 난바역 3번 출구 앞"></label><label class="field">개인 메모<textarea class="input" name="note" maxlength="1000" rows="3">${esc(p.note)}</textarea></label><div class="pd-form-row"><label class="field">장소 유형<select class="select" name="type">${[['unknown','기타'],['castle','관광'],['food','식당'],['cafe','카페'],['hotel','숙소']].map(([id,label])=>`<option value="${id}" ${p.type===id?'selected':''}>${label}</option>`).join('')}</select></label><label class="field">카테고리<select class="select" name="categoryId">${options(current.data,current.data.assignments[p.id]||null)}</select></label></div><p class="small muted">최대 500곳 · 기존 일정에 담긴 장소는 수정·삭제해도 그대로 남아요. 새 장소는 방문 미확인으로 저장합니다.</p><div class="pd-form-actions"><button class="btn" type="button" data-pd="place-cancel">취소</button><button class="btn primary" type="submit">장소 저장</button></div></form>`,`<button class="text-btn" data-pd="place-cancel">장소 입력 취소</button>`);const intent=placeForm,form=document.querySelector('#pd-place-form');if(window.GooglePlaceImport&&form){const isCurrent=()=>{if(placeForm!==intent||document.querySelector('#pd-place-form')!==form||scope()!==intent.scope)return false;const latest=read();return latest.valid&&latest.data.revision===intent.revision;};intent.dispose=GooglePlaceImport.mount(form,{isCurrent,fill:value=>{if(!isCurrent())return;form.elements.name.value=value.name;form.elements.sub.value=value.sub;intent.source={...value};intent.googleSourceSelected=true;}});}}
 function cancelPlaceForm(){if(!placeForm||!document.querySelector('#pd-place-form'))return false;if(busy)return true;const intent=placeForm;intent.dispose?.();placeForm=null;if(intent.callbacks.onCancel)intent.callbacks.onCancel();else{closeDialog();rerender();}return true;}
-async function savePlace(form){const intent=placeForm;if(!intent)return;const fields=form.elements,p={id:intent.id,name:fields.name.value,sub:fields.sub.value,note:fields.note.value,type:fields.type.value};if(intent.source?.name===p.name.trim()&&intent.source?.sub===p.sub.trim()){if(intent.source.googleMapsUrl)p.googleMapsUrl=intent.source.googleMapsUrl;if(intent.source.googlePlaceId)p.googlePlaceId=intent.source.googlePlaceId;}const data=await mutate({type:intent.isNew?'place-add':'place-update',place:p,categoryId:fields.categoryId.value||null},intent.scope,intent.revision);intent.dispose?.();placeForm=null;const saved={...data.places.find(p=>p.id===intent.id),categoryId:data.assignments[intent.id],categoryName:categoryName(data,data.assignments[intent.id])};if(intent.callbacks.onSaved)intent.callbacks.onSaved(saved);else{closeDialog();rerender();}toast('저장 장소를 저장했어요. 실제 위치와 이동 경로는 확인해 주세요.');}
+async function savePlace(form){const intent=placeForm;if(!intent)return;const fields=form.elements,p={id:intent.id,name:fields.name.value,sub:fields.sub.value,note:fields.note.value,type:fields.type.value};if(intent.source?.name===p.name.trim()&&intent.source?.sub===p.sub.trim()){if(intent.source.googleMapsUrl)p.googleMapsUrl=intent.source.googleMapsUrl;if(intent.source.googlePlaceId)p.googlePlaceId=intent.source.googlePlaceId;}const data=await mutate({type:intent.isNew?'place-add':'place-update',place:p,categoryId:fields.categoryId.value||null,googleSourceSelected:intent.googleSourceSelected===true&&intent.source?.name===p.name.trim()&&intent.source?.sub===p.sub.trim()},intent.scope,intent.revision);intent.dispose?.();placeForm=null;const saved={...data.places.find(p=>p.id===intent.id),categoryId:data.assignments[intent.id],categoryName:categoryName(data,data.assignments[intent.id])};if(intent.callbacks.onSaved)intent.callbacks.onSaved(saved);else{closeDialog();rerender();}toast('저장 장소를 저장했어요. 실제 위치와 이동 경로는 확인해 주세요.');}
 function confirmPlaceDelete(id){const current=read(),p=current.data.places.find(p=>p.id===id);if(!current.valid)throw Error('invalid-places');if(!p)throw Error('missing-place');placeDelete={id,scope:current.scope,revision:current.data.revision};openDialog('저장 장소를 삭제할까요?',`<h3>${esc(p.name)}</h3><p class="muted">저장 목록에서 장소와 메모를 삭제합니다. 이미 여행 일정에 담긴 장소 사본은 그대로 남아요.</p><p class="notice amber">이 장소 삭제는 되돌릴 수 없어요.</p>`,`<button class="btn" data-action="close">취소</button><button class="btn primary" data-pd="place-delete-confirm">장소 삭제</button>`);}
 function personalToolbar(saved){return '<div class="pd-categories" aria-label="개인 장소 필터">'+[['all','전체'],['visited','방문'],['unvisited','미방문'],['revisit','재방문 희망'],['notes','메모'],['excluded','제외']].map(([id,label])=>'<button class="chip '+(personalFilter===id?'active':'')+'" data-pd="personal-filter" data-personal-filter="'+id+'" aria-pressed="'+(personalFilter===id)+'">'+label+' <span>'+saved.filter(p=>PersonalPlaceState.matches(p,id)).length+'</span></button>').join('')+'</div>';}
 function personalLabels(p){const value=p.personal;return '<span class="tag gray">'+(value.visited?'방문 확인':'방문 미확인')+' · 방문 기록 '+value.visitCount+'건</span>'+(value.revisitIntent==='mixed'?'<span class="tag gray">재방문 의사 혼합</span>':value.revisitIntent==='yes'?'<span class="tag green">재방문 희망</span>':value.revisitIntent==='no'?'<span class="tag gray">재방문 의사 없음</span>':'')+(value.excludedForTrip?'<span class="tag red">현재 여행에서 제외</span>':'');}
