@@ -1140,9 +1140,10 @@ function config(raw){
 }
 function createSession(client,project,onChange=()=>{},onSecurityChange=()=>{},inviteRecoveryFetch){
  let user=null,securityUser=null,epoch=0,totpEpoch=0,loginAttempt=0,sdkObserved=false,sdkPrincipal=null,pendingPrincipal=null;
+ let ownInviteAttempt=null;const ownInviteConsumed=Object.freeze({});
  const current=()=>{if(!user)throw Error('auth-required');return {user:{...user},epoch};};
  const check=c=>{if(c.epoch!==epoch||c.user.id!==user?.id)throw Error('session-changed');};
- function clear(){epoch++;totpEpoch++;user=null;securityUser=null;onChange(null);}
+ function clear(){epoch++;totpEpoch++;user=null;securityUser=null;ownInviteAttempt=null;onChange(null);}
  client.auth.onAuthStateChange((event,sdkSession)=>{
   const next=sdkSession?.user?.id||null;
   if(event==='INITIAL_SESSION'&&next===null&&!sdkObserved&&!user&&!securityUser&&!pendingPrincipal)return;
@@ -1192,6 +1193,12 @@ function createSession(client,project,onChange=()=>{},onSecurityChange=()=>{},in
   }});
  }
  function captureInviteRecovery(externalFence=()=>{}){
+  const cap=captureInviteRequest('lookup',externalFence);return Object.freeze({assertCurrent:cap.assertCurrent,recover:cap.send});
+ }
+ function captureOwnInviteIssue(externalFence=()=>{}){
+  const cap=captureInviteRequest('issue',externalFence);return Object.freeze({assertCurrent:cap.assertCurrent,issue:cap.send,state:cap.state});
+ }
+ function captureInviteRequest(action,externalFence){
   const owner=securityUser||user,observed=epoch,totpObserved=totpEpoch;
   const email=value=>{if(typeof value!=='string')throw Error('input');const text=value.trim().toLowerCase();if(new TextEncoder().encode(text).length>254||!/^[a-z0-9.!#$%&'*+/=?^_\x60{|}~-]+@[a-z0-9]([a-z0-9.-]*[a-z0-9])?$/.test(text))throw Error('input');return text;};
   const own=(value,key)=>{const d=value&&Object.getOwnPropertyDescriptor(value,key);if(!d||!Object.hasOwn(d,'value'))throw Error('response');return d.value;};
@@ -1205,15 +1212,20 @@ function createSession(client,project,onChange=()=>{},onSecurityChange=()=>{},in
    if(own(principal,'id')!==owner.id||email(own(principal,'email'))!==address||typeof token!=='string'||!token.length||token.length>16384)throw Error('auth');
    const verified=await getClaims(token);live();if(own(verified,'error')!==null)throw Error('auth');const claims=own(own(verified,'data'),'claims'),now=Math.floor(Date.now()/1000),sid=own(claims,'session_id'),iat=own(claims,'iat'),exp=own(claims,'exp'),amr=own(claims,'amr');
    if(own(claims,'iss')!==project+'/auth/v1'||own(claims,'sub')!==owner.id||email(own(claims,'email'))!==address||own(claims,'aud')!=='authenticated'||own(claims,'role')!=='authenticated'||own(claims,'aal')!=='aal2'||!uuid(sid)||!Number.isSafeInteger(iat)||!Number.isSafeInteger(exp)||iat<0||iat>now||exp<=now||iat>=exp||!Array.isArray(amr)||amr.length>16||!amr.some(item=>own(item,'method')==='totp'&&Number.isSafeInteger(own(item,'timestamp'))&&own(item,'timestamp')>=0&&own(item,'timestamp')<=now)||boundSession!==null&&sid!==boundSession)throw Error('auth');
+   // Current one-owner pilot policy requires TOTP within 600 seconds before issuing.
+   if(action==='issue'&&!amr.some(item=>own(item,'method')==='totp'&&Number.isSafeInteger(own(item,'timestamp'))&&own(item,'timestamp')>=now-600&&own(item,'timestamp')<=now))throw Error('auth');
    const nbf=Object.getOwnPropertyDescriptor(claims,'nbf');if(nbf&&(!Object.hasOwn(nbf,'value')||!Number.isSafeInteger(nbf.value)||nbf.value<0||nbf.value>now))throw Error('auth');
    boundSession=sid;return token;
   }
   async function recover(id){
-   assertCurrent();try{requestId(id);}catch{throw Error('invite-recovery-input');}if(busy)throw Error('invite-recovery-busy');busy=true;
+   assertCurrent();try{requestId(id);}catch{throw Error('invite-recovery-input');}if(action==='issue'&&ownInviteAttempt!==null)throw Error('invite-issue-consumed');if(busy)throw Error('invite-recovery-busy');busy=true;
    const controller=new AbortController();let expired=false,timer;
    const live=()=>{assertCurrent();if(expired)throw Error('invite-recovery-unavailable');};
    async function execute(){
-    const token=await identity(live);live();const response=await inviteRecoveryFetch(project+'/functions/v1/service-invites/lookup',{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:JSON.stringify({kind:'issue',requestId:id,semantic:{email:address}}),signal:controller.signal,redirect:'error',credentials:'omit',cache:'no-store'});live();
+    const token=await identity(live);live();
+    // Consume across captures before the first transport call, including UNKNOWN/disabled results.
+    if(action==='issue'){if(ownInviteAttempt!==null)throw ownInviteConsumed;ownInviteAttempt=id;}
+    const response=await inviteRecoveryFetch(project+'/functions/v1/service-invites/'+(action==='issue'?'issue':'lookup'),{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:JSON.stringify(action==='issue'?{requestId:id,email:address}:{kind:'issue',requestId:id,semantic:{email:address}}),signal:controller.signal,redirect:'error',credentials:'omit',cache:'no-store'});live();
     if(response.redirected||response.status>=300&&response.status<400||![200,409].includes(response.status))throw Error('response');const length=response.headers.get('content-length');if(length!==null&&(!/^\d+$/.test(length)||Number(length)>4096))throw Error('size');
     const reader=response.body?.getReader();if(!reader)throw Error('body');const chunks=[];let bytes=0;const abort=()=>{try{void reader.cancel().catch(()=>{});}catch{}};controller.signal.addEventListener('abort',abort,{once:true});
     try{for(;;){const {done,value}=await reader.read();live();if(done)break;bytes+=value.byteLength;if(bytes>4096)throw Error('size');chunks.push(value);}}finally{controller.signal.removeEventListener('abort',abort);abort();try{reader.releaseLock();}catch{}}
@@ -1223,10 +1235,10 @@ function createSession(client,project,onChange=()=>{},onSecurityChange=()=>{},in
     await identity(live);live();return Object.freeze(result);
    }
    try{return await Promise.race([execute(),new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;controller.abort();reject(Error('invite-recovery-unavailable'));},15000);})]);}
-   catch{assertCurrent();throw Error('invite-recovery-unavailable');}
+   catch(error){assertCurrent();if(error===ownInviteConsumed)throw Error('invite-issue-consumed');throw Error('invite-recovery-unavailable');}
    finally{expired=true;clearTimeout(timer);controller.abort();busy=false;}
   }
-  return Object.freeze({assertCurrent,recover});
+  return Object.freeze({assertCurrent,send:recover,state(){assertCurrent();return Object.freeze({attempted:ownInviteAttempt!==null,requestId:ownInviteAttempt});}});
  }
  async function list(){const c=current();const {trips}=await getLegacyPersonalSource();check(c);return trips.sort((a,b)=>Date.parse(b.updated_at)-Date.parse(a.updated_at)).map(r=>({id:r.id,owner_id:r.owner_id,revision:r.revision,updated_at:r.updated_at,bytes:r.bytes,title:r.payload.title,favorite:r.payload.favorite,completed:r.payload.completed}));}
  async function get(id){const c=current();id=tripId(id);const {trips}=await getLegacyPersonalSource();check(c);const found=trips.find(r=>tripId(r.id)===id);if(!found)throw Error('trip-not-found');return found;}
@@ -1417,7 +1429,7 @@ function createSession(client,project,onChange=()=>{},onSecurityChange=()=>{},in
   let response;try{check(c);const work=client.rpc(name,input);response=await(typeof work?.retry==='function'?work.retry(false):work);}catch{check(c);throw Error('social-result-unknown');}check(c);
   let data;try{if(!response||typeof response!=='object')throw Error();const ds=Object.getOwnPropertyDescriptors(response);if(!ds.data||!Object.hasOwn(ds.data,'value')||!ds.error||!Object.hasOwn(ds.error,'value')||ds.error.value!==null)throw Error();data=helper.auditJSON(ds.data.value);}catch{check(c);throw Error('social-result-unknown');}check(c);return {data,error:null};
  }
- return {signIn,signInForSecurity,captureTotp,captureInviteRecovery,securityUser:()=>securityUser?{...securityUser}:user?{...user}:null,signOut,list,get,save,saveOperation,cancelOperation,operation,resolveTripOperation,getPersonal,getCoherentPersonal,getStorageStatusRPC,getLegacyPersonalSource,savePersonalOperation,cancelPersonalOperation,personalOperation,itineraryDraftRPC,copyPersonalUploadRPC,copyErasureRPC,shareCopyRPC,copyAcceptanceRPC,copyItineraryDraftRPC,copyItineraryExecutionRPC,calculationAcceptanceRPC,calculationJobRPC,itineraryConfirmationRPC,selectionJobRPC,socialRPC,history,exportTrips,guard(){const c=current();return ()=>check(c);},user:()=>user?{...user}:null,scope:()=>project+':'+current().user.id};
+ return {signIn,signInForSecurity,captureTotp,captureInviteRecovery,captureOwnInviteIssue,securityUser:()=>securityUser?{...securityUser}:user?{...user}:null,signOut,list,get,save,saveOperation,cancelOperation,operation,resolveTripOperation,getPersonal,getCoherentPersonal,getStorageStatusRPC,getLegacyPersonalSource,savePersonalOperation,cancelPersonalOperation,personalOperation,itineraryDraftRPC,copyPersonalUploadRPC,copyErasureRPC,shareCopyRPC,copyAcceptanceRPC,copyItineraryDraftRPC,copyItineraryExecutionRPC,calculationAcceptanceRPC,calculationJobRPC,itineraryConfirmationRPC,selectionJobRPC,socialRPC,history,exportTrips,guard(){const c=current();return ()=>check(c);},user:()=>user?{...user}:null,scope:()=>project+':'+current().user.id};
 }
 return {config,createSession};
 });
@@ -11972,7 +11984,7 @@ const settings=TripCloud.config(window.TRIP_CLOUD_CONFIG),esc=escapeText;
 let pendingGuest=false,operationFlow=null,operationShown=null;
 let session=null,busy=false,notice='',failed=false,filter='all',dialogOpen=false;
 let storageSummary=null,storageState='unqueried',storageObservation=0,authObservation=0;
-let inviteRecoveryShown=null,inviteRecoverySequence=0;
+let inviteRecoveryShown=null,inviteRecoverySequence=0,inviteRequestId='';
 const host=document.createElement('section');host.id='cloud-storage';host.className='cloud-storage';host.setAttribute('aria-label','계정 여행 저장');document.querySelector('#main').before(host);
 function paint(){const user=session?.user(),security=session?.securityUser?.();host.innerHTML=`<div class="cloud-copy"><b>☁ ${user?'내 계정 여행':'기기를 바꿔도, 이어지는 여행'}</b><span>${esc(notice||(user?'편집은 기기에 자동 저장돼요. 다른 기기에서 열기 전 계정에 저장해 주세요.':settings.enabled?'로그인하면 다른 기기에서 저장한 여행을 불러올 수 있어요.':'계정 저장 연결 준비 중 · 현재 편집은 이 브라우저에 자동 저장돼요.'))}</span></div><div class="row wrap"><button class="btn small" data-cloud="save" ${busy?'disabled':''}>계정에 저장</button><button class="btn small primary" data-cloud="open" ${busy?'disabled':''}>${user?'계정 보관함':'로그인 · 계정 보관함'}</button><button class="btn small" data-cloud="personal-open" ${busy?'disabled':''}>전체 개인 자료</button><button class="btn small" data-cloud="itinerary-open" ${busy?'disabled':''}>이 여행 계정 일정</button><button class="btn small" data-cloud="copy-erasure-open" ${busy?'disabled':''}>관리 사본 삭제</button><button class="btn small" data-cloud="social-open" ${busy?'disabled':''}>계정 공유</button><button class="btn small" data-cloud="notifications-open" ${busy?'disabled':''}>계정 알림</button>${user||security?'<button class="btn small" data-cloud="logout" '+(busy?'disabled':'')+'>이 탭 로그아웃</button>':''}<button class="btn small" data-cloud="operation-check" ${busy?'disabled':''}>계정 저장 작업 확인</button></div>${limits()}`;document.querySelectorAll('#dialog-body [data-cloud-storage-status]').forEach(el=>{el.textContent=storageMessage();});host.classList.toggle('cloud-error',failed);window.ServerSocialAccountUI?.afterRender();}
 function errorText(e){
@@ -12029,16 +12041,41 @@ async function openItinerary(){
 }
 function invalidateInviteRecovery(){inviteRecoverySequence++;inviteRecoveryShown=null;}
 function openInviteRecovery(){
- modal('<p class="muted">이 탭은 계정 보안 확인만 로그인한 상태입니다. 계정 여행은 열지 않습니다.</p><button type="button" class="btn primary" data-cloud="totp-open">2단계 인증 · 코드 다시 확인</button><button type="button" class="btn" data-cloud="logout">이 탭 로그아웃</button><h3>본인 초대 요청 결과 조회</h3><p class="small muted">운영자용 조회입니다. 현재 계정 이메일의 기존 요청만 확인하며, 새 초대 생성·재발급·메일 발송을 시작하지 않습니다. 필요한 경우 먼저 인증 앱 코드를 다시 확인해 주세요.</p><form id="cloud-invite-lookup" class="trip-edit"><label class="field">기존 요청 ID<input class="input" name="requestId" type="text" autocomplete="off" maxlength="160" pattern="[-A-Za-z0-9]{1,160}" required></label><button class="btn primary" type="submit">기존 요청 결과만 조회</button></form>'+limits());
- const captured=session,observation=authObservation,ticket=inviteRecoverySequence,route=window.location?.href,shown={form:null,api:null};
+ modal('<p class="muted">이 탭은 계정 보안 확인만 로그인한 상태입니다. 계정 여행은 열지 않습니다.</p><button type="button" class="btn primary" data-cloud="totp-open">2단계 인증 · 코드 다시 확인</button><button type="button" class="btn" data-cloud="logout">이 탭 로그아웃</button><h3>본인 초대 요청 결과 조회</h3><p class="small muted">기존 요청 조회는 새 초대 생성·재발급·메일 발송을 시작하지 않습니다. 본인 초대는 아래 별도 버튼으로 현재 계정 이메일에만 요청합니다. 필요한 경우 먼저 인증 앱 코드를 다시 확인해 주세요.</p><form id="cloud-invite-lookup" class="trip-edit"><label class="field">기존 요청 ID<input class="input" name="requestId" type="text" value="'+esc(inviteRequestId)+'" autocomplete="off" maxlength="160" pattern="[-A-Za-z0-9]{1,160}" required></label><button class="btn primary" type="submit">기존 요청 결과만 조회</button><p id="cloud-own-invite-state" class="small muted" role="status"></p><button class="btn" type="submit" data-invite-issue="true" disabled>본인 이메일로 초대 메일 요청</button></form>'+limits());
+ const captured=session,observation=authObservation,ticket=inviteRecoverySequence,route=window.location?.href,shown={form:null,api:null,issue:null};
  const fence=()=>{if(captured!==session||observation!==authObservation||ticket!==inviteRecoverySequence||!passwordSignInAllowed()||window.location?.href!==route||document.querySelector('#dialog')?.open!==true||shown.form&&document.querySelector('#cloud-invite-lookup')!==shown.form)throw Error('session-changed');};
  try{shown.api=captured.captureInviteRecovery(fence);inviteRecoveryShown=shown;}catch{feedback('기존 초대 조회 연결을 확인하지 못했어요. 로그인과 연결 설정을 확인해 주세요.',true);}
+ try{shown.issue=captured.captureOwnInviteIssue(fence);const form=document.querySelector('#cloud-invite-lookup');if(form){shown.form=form;syncOwnInviteState(shown,form);}}catch{}
+}
+function syncOwnInviteState(shown,form){
+ if(!shown?.issue)return;
+ try{
+  shown.issue.assertCurrent();const state=shown.issue.state(),field=form.elements.requestId,button=form.querySelector?.('[data-invite-issue]');
+  if(state.attempted){field.value=state.requestId;field.readOnly=true;inviteRequestId=state.requestId;}
+  else{field.readOnly=false;if(typeof field.value==='string'&&field.value.length<=160)inviteRequestId=field.value;}
+  if(button)button.disabled=state.attempted||!/^[-A-Za-z0-9]{1,160}$/.test(field.value)||['constructor','prototype'].includes(field.value);
+  const note=document.querySelector('#cloud-own-invite-state');if(note)note.textContent=state.attempted?'이 탭에서 이미 요청을 전송했습니다. 표시된 요청 ID로 기존 결과만 조회해 주세요.':'본인 초대 요청은 아래 버튼을 직접 눌렀을 때만 전송합니다. 요청 ID를 보관해 주세요.';
+ }catch{}
+}
+function inviteDeliveryLabel(result){
+ const labels={queued:'메일 대기',leased:'메일 처리 중',provider_accepted:'메일 서버 접수',delivery_unknown:'메일 전달 결과 미확인',failed:'메일 처리 실패',cancelled:'요청 취소'},key=result.receipt?.dispatchState;
+ return Object.hasOwn(labels,key)?labels[key]:'처리 기록 확인';
+}
+async function issueOwnInvite(form){
+ const shown=inviteRecoveryShown;if(!shown?.issue)return;shown.form=form;syncOwnInviteState(shown,form);
+ try{
+  shown.issue.assertCurrent();const result=await shown.issue.issue(form.elements.requestId.value);shown.issue.assertCurrent();
+  feedback(result.state==='READY'?'본인 초대 요청의 처리 기록을 확인했어요. 발급 응답 당시: '+inviteDeliveryLabel(result)+'. 현재 상태는 기존 결과 조회로 확인해 주세요. 메일 수신이나 가입 완료는 별도입니다.':'본인 초대 요청 결과가 미확인입니다. 표시된 같은 ID로 기존 결과만 조회하고 새 발급·재발급은 하지 않습니다.',result.state!=='READY');
+ }catch{
+  try{shown.issue.assertCurrent();}catch{return;}
+  feedback(shown.issue.state().attempted?'전송 시도 이후 결과를 확인하지 못했어요. 표시된 같은 ID로 기존 결과만 조회해 주세요.':'발급 요청을 전송하지 못했어요. 로그인·2단계 인증과 요청 ID를 확인해 주세요.',true);
+ }finally{syncOwnInviteState(shown,form);}
 }
 async function lookupInvite(form){
- const shown=inviteRecoveryShown;if(!shown)return;shown.form=form;
+ const shown=inviteRecoveryShown;if(!shown)return;shown.form=form;syncOwnInviteState(shown,form);
  try{
   shown.api.assertCurrent();const result=await shown.api.recover(form.elements.requestId.value);shown.api.assertCurrent();
-  feedback(result.state==='READY'?'기존 초대 요청 기록을 확인했어요. 메일 수신이나 가입 완료를 뜻하지 않습니다.':'기존 요청 결과가 미확인입니다. 실패로 확정하지 않으며 새 초대를 만들거나 재발급하지 않습니다.',result.state!=='READY');
+  feedback(result.state==='READY'?'기존 초대 요청 기록을 확인했어요. 조회 당시: '+inviteDeliveryLabel(result)+'. 메일 수신이나 가입 완료를 뜻하지 않습니다.':'기존 요청 결과가 미확인입니다. 실패로 확정하지 않으며 새 초대를 만들거나 재발급하지 않습니다.',result.state!=='READY');
  }catch{try{shown.api.assertCurrent();}catch{return;}feedback('조회 결과를 확인하지 못했어요. 새 발급 없이 로그인·2단계 인증과 연결 상태를 확인한 뒤 같은 요청 ID로 다시 조회해 주세요.',true);}
 }
 async function open(){
@@ -12141,10 +12178,11 @@ async function logout(){
 async function run(fn){if(busy||window.ServerSocialAccountUI?.isBusy()||window.CopyErasureUI?.isBusy())return;window.AccountTotpUI?.cancel();window.ServerSocialAccountUI?.cancelPending();window.CopyErasureUI?.cancelPending();busy=true;paint();const roots=['#main','#trip-storage','#dialog-body'].map(s=>document.querySelector(s));roots.forEach(el=>{if(el)el.inert=true;});try{await fn();}catch(e){feedback(errorText(e),true);toast(errorText(e));}finally{busy=false;roots.forEach(el=>{if(el)el.inert=TripUI.isLocked()&&el!==document.querySelector('#dialog-body');});paint();if(pendingGuest){pendingGuest=false;await run(()=>TripUI.switchAccount(null));}}}
 document.addEventListener('click',event=>{const el=event.target.closest('[data-cloud]');if(!el||el.dataset.cloud==='restore')return;event.preventDefault();void run(async()=>{if(el.dataset.cloud.startsWith('operation-')){if(!session?.user()){await open();return;}await operationAction(el.dataset.cloud);return;}switch(el.dataset.cloud){case'totp-open':if(session?.securityUser?.()){closeDialog();window.AccountTotpUI?.open(session);}else await open();break;case'storage-status':await refreshStorage();break;case'copy-erasure-open':await openCopyErasure();break;case'social-open':await openSocial('shares');break;case'notifications-open':await openSocial('notifications');break;case'itinerary-open':await openItinerary();break;case'personal-open':if(session?.user())await window.PersonalCloudUI.open(session);else await open();break;case'password-recovery':if(!session?.user()&&typeof window.AuthCallbackUI?.openPasswordRecovery==='function'){closeDialog();await window.AuthCallbackUI.openPasswordRecovery(window);}break;case'receipt-recovery':if(!session?.user()&&typeof window.AuthCallbackUI?.openReceiptRecovery==='function'){closeDialog();await window.AuthCallbackUI.openReceiptRecovery(window);}break;case'open':await open();break;case'save':await saveCurrent();break;case'filter':filter=el.dataset.filter;await open();break;case'load':{const check=accountCheck();check();const r=await session.get(el.dataset.id);check();await TripUI.importCloud({id:r.id,revision:r.revision,payload:r.payload});check();feedback('계정 여행을 불러왔어요. 변경한 내용은 ‘계정에 저장’으로 반영해 주세요.');break;}case'guest':await guest();break;case'import':await TripUI.importGuest(el.dataset.id);await saveCurrent();break;case'fork':{const r=await TripUI.checkpoint();await TripUI.importCopy({...r.payload,title:r.payload.title.slice(0,112)+' · 사본'});await saveCurrent();break;}case'export':{const payloads=await session.exportTrips();if(!payloads.length){feedback('백업할 계정 여행이 없어요.');break;}await TripUI.exportFile(payloads,'travel-account-backup.json');feedback('계정에 저장된 여행의 백업 다운로드를 요청했어요. 아직 계정에 저장하지 않은 편집은 현재 편집 백업을 이용해 주세요.');break;}case'history':await history(el.dataset.id);break;case'logout':if(window.PersonalCloudUI?.isBusy()||window.ServerItineraryAccountUI?.isBusy()||window.ItineraryUI?.isBusy())break;await logout();break;}});});
 function passwordSignInAllowed(){if(window.__travelHereAuthCallbackBlocked||window.__travelHereProductConfigBlocked)return false;return typeof window.AuthCallbackUI?.canSignIn==='function'?window.AuthCallbackUI.canSignIn():!window.__travelHereAuthCallback;}
-document.addEventListener('submit',event=>{if(event.target.id==='cloud-invite-lookup'){event.preventDefault();const form=event.target;void run(()=>lookupInvite(form));return;}if(event.target.id!=='cloud-login')return;event.preventDefault();const form=event.target;if(!passwordSignInAllowed()){form.elements.password.value='';feedback('초대·복구 처리와 임시 연결 종료를 먼저 확인해 주세요. 비밀번호는 전송하지 않았습니다.',true);return;}const securityOnly=event.submitter?.dataset.cloudSecurity==='true',email=form.elements.email.value.trim(),password=form.elements.password.value;form.elements.password.value='';void run(async()=>{if(!passwordSignInAllowed()){feedback('초대·복구 처리와 임시 연결 종료를 먼저 확인해 주세요. 비밀번호는 전송하지 않았습니다.',true);return;}if(securityOnly){await session.signInForSecurity(email,password);closeDialog();window.AccountTotpUI?.open(session);return;}await session.signIn(email,password);try{await TripUI.switchAccount(session.scope(),session.guard());}catch(e){await session.signOut();throw e;}feedback('로그인했어요. 계정 여행을 불러오거나 기기에만 있던 여행을 가져오세요.');await refreshStorage();await open();});});
+document.addEventListener('input',event=>{const form=event.target?.form,shown=inviteRecoveryShown;if(form?.id!=='cloud-invite-lookup'||event.target.name!=='requestId'||!shown||document.querySelector('#cloud-invite-lookup')!==form)return;if(!shown.form)shown.form=form;syncOwnInviteState(shown,form);});
+document.addEventListener('submit',event=>{if(event.target.id==='cloud-invite-lookup'){event.preventDefault();const form=event.target,ownIssue=event.submitter?.dataset.inviteIssue==='true';void run(()=>ownIssue?issueOwnInvite(form):lookupInvite(form));return;}if(event.target.id!=='cloud-login')return;event.preventDefault();const form=event.target;if(!passwordSignInAllowed()){form.elements.password.value='';feedback('초대·복구 처리와 임시 연결 종료를 먼저 확인해 주세요. 비밀번호는 전송하지 않았습니다.',true);return;}const securityOnly=event.submitter?.dataset.cloudSecurity==='true',email=form.elements.email.value.trim(),password=form.elements.password.value;form.elements.password.value='';void run(async()=>{if(!passwordSignInAllowed()){feedback('초대·복구 처리와 임시 연결 종료를 먼저 확인해 주세요. 비밀번호는 전송하지 않았습니다.',true);return;}if(securityOnly){await session.signInForSecurity(email,password);closeDialog();window.AccountTotpUI?.open(session);return;}await session.signIn(email,password);try{await TripUI.switchAccount(session.scope(),session.guard());}catch(e){await session.signOut();throw e;}feedback('로그인했어요. 계정 여행을 불러오거나 기기에만 있던 여행을 가져오세요.');await refreshStorage();await open();});});
 if(settings.enabled&&!window.__travelHereAuthCallbackBlocked&&!window.__travelHereProductConfigBlocked){
  const client=supabase.createClient(settings.url,settings.publishableKey,{db:{retry:false},auth:{persistSession:false,autoRefreshToken:true,detectSessionInUrl:false},global:{fetch:(url,options={})=>{const timeout=AbortSignal.timeout(15000);return fetch(url,{...options,signal:options.signal?AbortSignal.any([options.signal,timeout]):timeout});}}});
- session=TripCloud.createSession(client,settings.url,user=>{invalidateInviteRecovery();window.AccountTotpUI?.cancel();authObservation++;storageObservation++;storageSummary=null;storageState='unqueried';window.ServerSocialAccountUI?.configure(session,settings.enabled);operationFlow=null;operationShown=null;if(user)pendingGuest=false;if(!user&&session?.securityUser?.()){pendingGuest=false;paint();return;}if(!user){notice='다시 로그인해 계정 저장 상태를 확인해 주세요.';TripUI.lockAccount();pendingGuest=true;if(!busy){pendingGuest=false;void run(()=>TripUI.switchAccount(null));}}paint();},()=>{invalidateInviteRecovery();window.AccountTotpUI?.cancel();},fetch.bind(window));
+ session=TripCloud.createSession(client,settings.url,user=>{inviteRequestId='';invalidateInviteRecovery();window.AccountTotpUI?.cancel();authObservation++;storageObservation++;storageSummary=null;storageState='unqueried';window.ServerSocialAccountUI?.configure(session,settings.enabled);operationFlow=null;operationShown=null;if(user)pendingGuest=false;if(!user&&session?.securityUser?.()){pendingGuest=false;paint();return;}if(!user){notice='다시 로그인해 계정 저장 상태를 확인해 주세요.';TripUI.lockAccount();pendingGuest=true;if(!busy){pendingGuest=false;void run(()=>TripUI.switchAccount(null));}}paint();},()=>{invalidateInviteRecovery();window.AccountTotpUI?.cancel();},fetch.bind(window));
 }
 window.addEventListener?.('pagehide',invalidateInviteRecovery);
 window.ServerSocialAccountUI?.configure(session,settings.enabled);
