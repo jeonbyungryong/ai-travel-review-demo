@@ -1296,19 +1296,21 @@ function createSession(client,project,onChange=()=>{},onSecurityChange=()=>{},in
    assertCurrent();let challenge,expectedKeyId;
    try{operationJSON(input);operationFields(input,['challenge','expectedKeyId']);({challenge,expectedKeyId}=input);encoded(challenge,32);if(typeof expectedKeyId!=='string'||!/^[-A-Za-z0-9_]{1,64}$/.test(expectedKeyId))throw Error('key');}catch{throw Error('remote-seal-proof-input');}
    if(attempted||remoteProofChallenges.has(challenge))throw Error('remote-seal-proof-consumed');attempted=true;remoteProofChallenges.add(challenge);
-   const controller=new AbortController();let expired=false,timer;
+   const controller=new AbortController();let expired=false,timer,failure='auth-before';
    const live=()=>{assertCurrent();if(expired)throw Error('expired');};
    async function execute(){
-    const token=await identity(live);live();
+    const token=await identity(live);live();failure='transport-unknown';
     const response=await inviteRecoveryFetch(project+'/functions/v1/service-invites/recovery-proof',{method:'POST',headers:{authorization:'Bearer '+token,'content-type':'application/json'},body:JSON.stringify({challenge}),signal:controller.signal,redirect:'error',credentials:'omit',cache:'no-store'});live();
-    if(response.status!==200||response.redirected||!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(response.headers.get('content-type')||''))throw Error('response');const length=response.headers.get('content-length');if(length!==null&&(!/^\d+$/.test(length)||Number(length)>2048))throw Error('size');
+    if(response.status!==200){failure=[401,403,429,503].includes(response.status)?'http-'+response.status:'http-rejected';throw Error('response');}
+    failure='response-unverified';
+    if(response.redirected||!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(response.headers.get('content-type')||''))throw Error('response');const length=response.headers.get('content-length');if(length!==null&&(!/^\d+$/.test(length)||Number(length)>2048))throw Error('size');
     const reader=response.body?.getReader();if(!reader)throw Error('body');let text='',size=0;const decoder=new TextDecoder('utf-8',{fatal:true});const cancel=()=>{try{void reader.cancel().catch(()=>{});}catch{}};controller.signal.addEventListener('abort',cancel,{once:true});
     try{for(;;){const {done,value}=await reader.read();live();if(done)break;size+=value.byteLength;if(size>2048)throw Error('size');text+=decoder.decode(value,{stream:true});}text+=decoder.decode();}finally{controller.signal.removeEventListener('abort',cancel);cancel();try{reader.releaseLock();}catch{}}
     const raw=JSON.parse(text);operationJSON(raw);operationFields(raw,['proof']);const p=raw.proof;operationFields(p,['version','project','keyId','challenge','nonce','ciphertext']);
     if(p.version!==1||p.project!=='cybofxetcxdtodkphkes'||p.keyId!==expectedKeyId||p.challenge!==challenge)throw Error('binding');encoded(p.nonce,12);encoded(p.ciphertext,62);
-    await identity(live);live();return Object.freeze({proof:Object.freeze({...p})});
+    failure='auth-after';await identity(live);live();return Object.freeze({proof:Object.freeze({...p})});
    }
-   try{return await Promise.race([execute(),new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;controller.abort();reject(Error('expired'));},15000);})]);}catch{assertCurrent();throw Error('remote-seal-proof-unavailable');}finally{expired=true;clearTimeout(timer);controller.abort();}
+   try{return await Promise.race([execute(),new Promise((_,reject)=>{timer=setTimeout(()=>{expired=true;controller.abort();reject(Error('expired'));},15000);})]);}catch{assertCurrent();throw Error('remote-seal-proof-'+failure);}finally{expired=true;clearTimeout(timer);controller.abort();}
   }});
  }
  async function list(){const c=current();const {trips}=await getLegacyPersonalSource();check(c);return trips.sort((a,b)=>Date.parse(b.updated_at)-Date.parse(a.updated_at)).map(r=>({id:r.id,owner_id:r.owner_id,revision:r.revision,updated_at:r.updated_at,bytes:r.bytes,title:r.payload.title,favorite:r.payload.favorite,completed:r.payload.completed}));}
@@ -12179,7 +12181,7 @@ function invalidateRemoteSealProof(){if(sealProofShown){sealProofShown.proof=nul
 function invalidateInviteRecovery(){inviteRecoverySequence++;inviteRecoveryShown=null;invalidateRemoteSealProof();}
 function openRemoteSealProof(){
  if(!settings.enabled||!session?.securityUser?.()||!passwordSignInAllowed())throw Error('auth-required');
- modal('<h3>복원 키 확인용 응답 만들기</h3><p>다른 PC에서 먼저 새 확인 문자열을 만들고 복원 기록의 키 식별자를 확인해 주세요. 비밀번호나 키 원문을 입력하지 마세요.</p><form id="cloud-seal-proof" class="trip-edit"><label class="field">다른 PC에서 만든 확인 문자열<input class="input" style="min-height:44px" name="challenge" autocomplete="off" spellcheck="false" minlength="43" maxlength="43" pattern="[-A-Za-z0-9_]{43}" required></label><label class="field">다른 PC 복원 기록의 키 식별자<input class="input" style="min-height:44px" name="expectedKeyId" autocomplete="off" spellcheck="false" maxlength="64" pattern="[-A-Za-z0-9_]{1,64}" required></label><button class="btn primary" style="min-height:44px" type="submit">복원 키 확인용 응답 만들기</button><button class="btn" style="min-height:44px" type="button" data-cloud="seal-proof-download" disabled>확인용 응답 JSON 다운로드</button></form><p class="small muted">요청은 한 번만 전송합니다. 결과를 받지 못해도 같은 문자열로 다시 요청하지 마세요. 새 시도에는 다른 PC에서 만든 새 문자열이 필요합니다. 다운로드 후 다른 PC의 기존 복원 키로 확인해야 하며, 이 화면만으로 복구 완료가 되지 않습니다.</p>');
+ modal('<h3>복원 키 확인용 응답 만들기</h3><p>다른 PC에서 먼저 새 확인 문자열을 만들고 복원 기록의 키 식별자를 확인해 주세요. 비밀번호나 키 원문을 입력하지 마세요.</p><p>일반 로그인만으로는 진행할 수 없어요. 먼저 최근 10분 이내의 2단계 인증을 확인한 뒤 확인 문자열을 입력해 주세요.</p><button type="button" class="btn" style="min-height:44px" data-cloud="totp-open">2단계 인증 먼저 확인</button><form id="cloud-seal-proof" class="trip-edit"><label class="field">다른 PC에서 만든 확인 문자열<input class="input" style="min-height:44px" name="challenge" autocomplete="off" spellcheck="false" minlength="43" maxlength="43" pattern="[-A-Za-z0-9_]{43}" required></label><label class="field">다른 PC 복원 기록의 키 식별자<input class="input" style="min-height:44px" name="expectedKeyId" autocomplete="off" spellcheck="false" maxlength="64" pattern="[-A-Za-z0-9_]{1,64}" required></label><button class="btn primary" style="min-height:44px" type="submit">복원 키 확인용 응답 만들기</button><button class="btn" style="min-height:44px" type="button" data-cloud="seal-proof-download" disabled>확인용 응답 JSON 다운로드</button></form><p class="small muted">요청은 한 번만 전송합니다. 결과를 받지 못해도 같은 문자열로 다시 요청하지 마세요. 새 시도에는 다른 PC에서 만든 새 문자열이 필요합니다. 다운로드 후 다른 PC의 기존 복원 키로 확인해야 하며, 이 화면만으로 복구 완료가 되지 않습니다.</p>');
  const captured=session,observation=authObservation,route=window.location?.href,form=document.querySelector('#cloud-seal-proof'),shown={form,proof:null,attempted:false,values:null,api:null};
  const fence=()=>{if(sealProofShown!==shown||captured!==session||observation!==authObservation||!passwordSignInAllowed()||window.location?.href!==route||document.querySelector('#dialog')?.open!==true||document.querySelector('#cloud-seal-proof')!==form||shown.values&&(form.elements.challenge.value!==shown.values.challenge||form.elements.expectedKeyId.value!==shown.values.expectedKeyId))throw Error('session-changed');};
  sealProofShown=shown;try{shown.api=captured.captureRemoteSealProof(fence);}catch{invalidateRemoteSealProof();feedback('로그인·2단계 인증과 연결 설정을 확인해 주세요.',true);}
@@ -12188,7 +12190,24 @@ async function requestRemoteSealProof(form){
  const shown=sealProofShown;if(!shown||shown.form!==form)return;shown.proof=null;form.querySelector('[data-cloud="seal-proof-download"]').disabled=true;
  if(shown.attempted)return;shown.api.assertCurrent();shown.attempted=true;shown.values={challenge:form.elements.challenge.value,expectedKeyId:form.elements.expectedKeyId.value};form.querySelector('[type="submit"]').disabled=true;
  try{const result=await shown.api.request(shown.values);shown.api.assertCurrent();shown.proof=result;form.querySelector('[data-cloud="seal-proof-download"]').disabled=false;feedback('확인용 응답을 받았어요. JSON을 다운로드해 다른 PC의 기존 복원 키로 확인해 주세요. 복구 검증은 아직 완료되지 않았습니다.');}
- catch{if(sealProofShown!==shown)return;shown.proof=null;feedback('이번 요청의 응답을 확인하지 못했어요. 같은 문자열로 재시도하지 말고 다른 PC에서 새 확인 문자열을 만든 뒤 새로 시작해 주세요.',true);}
+  catch(error){
+   if(sealProofShown!==shown)return;shown.proof=null;let code;try{code=Object.getOwnPropertyDescriptor(error,'message')?.value;}catch{}
+   const details={
+    'remote-seal-proof-input':'확인 문자열·키 식별자의 형식을 확인하지 못해 요청을 보내지 않았어요 (INPUT_INVALID). 준비 기록과 입력을 대조해 주세요.',
+    'remote-seal-proof-consumed':'이미 사용한 확인 문자열이라 새 요청을 보내지 않았어요 (ATTEMPT_CONSUMED).',
+    'remote-seal-proof-auth-before':'확인용 요청을 보내기 전에 로그인·2단계 인증을 확인하지 못했어요 (AUTH_BEFORE). 먼저 2단계 인증을 확인해 주세요.',
+    'remote-seal-proof-http-401':'서버가 로그인을 확인하지 못했어요 (HTTP_401). 로그인·2단계 인증 상태를 확인해 주세요.',
+    'remote-seal-proof-http-403':'서버가 접근을 거절했어요 (HTTP_403). 운영자 권한·2단계 인증 상태를 확인해 주세요.',
+    'remote-seal-proof-http-429':'서버의 요청 제한에 도달했어요 (HTTP_429). 현재 상태를 보존해 주세요.',
+    'remote-seal-proof-http-503':'서버 연결을 확인하지 못했어요 (HTTP_503). 현재 상태를 보존해 주세요.',
+    'remote-seal-proof-http-rejected':'서버에서 성공으로 확인할 수 없는 응답을 받았어요 (HTTP_REJECTED). 처리 여부는 확정할 수 없어요.',
+    'remote-seal-proof-response-unverified':'받은 응답의 형식이나 요청 일치를 확인하지 못했어요 (RESPONSE_UNVERIFIED). 다운로드를 막았어요.',
+    'remote-seal-proof-auth-after':'응답 뒤 로그인·2단계 인증을 확인하지 못했어요 (AUTH_AFTER). 다운로드를 막았어요.',
+    'session-changed':'로그인이나 화면이 바뀌어 응답 사용을 멈췄어요 (SESSION_CHANGED).',
+    'remote-seal-proof-transport-unknown':'확인용 요청의 전송 결과를 확인하지 못했어요 (TRANSPORT_UNKNOWN). 서버 도달 여부는 미확인이에요.'
+   };
+   feedback((Object.hasOwn(details,code)?details[code]:details['remote-seal-proof-transport-unknown'])+' 같은 문자열로 재시도하지 말고, 다음 시도에는 다른 PC에서 새 확인 문자열을 만들어 주세요.',true);
+  }
 }
 function downloadRemoteSealProof(){
  const shown=sealProofShown;if(!shown?.proof)return;
