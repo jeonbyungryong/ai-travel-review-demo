@@ -1009,6 +1009,13 @@ label.field{font-size:13px;font-weight:600;min-width:0}
 #server-social-account-panel input,
 #server-social-account-panel select,
 #server-social-account-panel textarea { max-width:100%; min-height:44px; }
+#server-social-account-panel .social-share-selection { min-width:0; margin:16px 0; }
+#server-social-account-panel .social-share-choice { display:flex; align-items:flex-start; gap:8px; min-height:44px; padding:8px; cursor:pointer; }
+#server-social-account-panel .social-share-choice input { flex:0 0 44px; width:44px; height:44px; margin:0; }
+#server-social-account-panel .social-share-choice span { min-width:0; padding-top:10px; }
+#server-social-account-panel .social-share-choice .social-share-stops { display:block; padding-top:8px; }
+#server-social-account-panel .social-share-stops span { display:block; padding-top:0; }
+#server-social-account-panel .social-share-choice:focus-within { outline:2px solid currentColor; outline-offset:2px; }
 </style></head><body>
 <a class="skip" href="#main">본문으로 바로 가기</a>
 <div class="reviewbar"><span>컨셉 데모 v0.14<span class="desktop-note"> · 장소·후기·가격은 합성 예시</span></span><button data-action="nav" data-page="guide">검토 안내 ↗</button></div>
@@ -11480,7 +11487,7 @@ function valid(s){
 }
 function check(s){if(!valid(s))throw Error('social-screen-changed');}
 async function step(s,fn){check(s);try{const value=await fn();check(s);return value;}catch(error){check(s);throw error;}}
-function purge(s){s.copy=null;s.copyPrepared=false;clearDetail(s);s.confirm=null;s.compose=false;s.account=null;s.shares=null;s.notifications=null;s.pending=null;s.recipientPage=null;s.recipientIds=[];s.recipientKnown=new Set();s.draft=null;s.notice='계정이나 화면이 바뀌었습니다.';if(s.panel)s.panel.innerHTML='';}
+function purge(s){s.copy=null;s.copyPrepared=false;clearDetail(s);s.confirm=null;s.compose=false;s.account=null;s.selection=null;s.shares=null;s.notifications=null;s.pending=null;s.recipientPage=null;s.recipientIds=[];s.recipientKnown=new Set();s.draft=null;s.notice='계정이나 화면이 바뀌었습니다.';if(s.panel)s.panel.innerHTML='';}
 function clearDetail(s){clearBlocks(s);s.detail=null;s.recommendation=null;s.recommendationReadState='unread';s.report=null;s.reportReadState='unread';s.reportReason='';s.detailObservation=(s.detailObservation||0)+1;}
 async function readReport(s,versionId,observation){
  s.report=null;s.reportReadState='loading';s.reportReason='';render(s);
@@ -11556,11 +11563,36 @@ function recipientHTML(s){
  const ids=s.recipientIds||[],page=s.recipientPage;
  return '<section><h4>지정 회원 선택</h4><p>이름·이메일이 제공되지 않아 opaque 회원 ID로 구별합니다. 검색을 바꿔도 선택은 유지합니다. 미리보기·발행 때 서버가 자격을 다시 검사합니다.</p><label class="field">회원 ID 앞부분 · 비우면 전체 후보<input class="input" name="recipientQuery" autocomplete="off" maxlength="36" value="'+esc(s.draft?.recipientQuery||'')+'"></label>'+button(s,'회원 조회','recipients-search')+'<div id="social-account-recipient-results">'+(s.recipientError?'<p role="alert">회원 조회에 실패했습니다. 후보와 선택을 지웠습니다. 조건을 좁히거나 연결·정책을 확인하세요.</p>':page?'<p>서버 지정 한도 '+esc(page.selectionLimit)+'명</p>'+(!page.items.length?'<p>조건에 맞는 회원이 없습니다.</p>':'<ul>'+page.items.map(x=>'<li><label><input type="checkbox" data-social-account="recipient-toggle" data-id="'+esc(x.memberId)+'" '+(ids.includes(x.memberId)?'checked ':'')+(s.working?'disabled ':'')+'>'+esc(x.memberId)+'</label></li>').join('')+'</ul>')+(page.nextCursor?button(s,'회원 다음 페이지','recipients-next'):''):'<p>회원 목록 미조회</p>')+'</div><p>한 페이지에 회원 1명을 표시합니다.</p><p>선택 '+esc(ids.length)+'명</p><ul>'+ids.map(id=>'<li>'+esc(id)+button(s,'선택 제거','recipient-remove','data-id="'+esc(id)+'"')+'</li>').join('')+'</ul>'+button(s,'선택 모두 지우기','recipients-clear')+'</section>';
 }
+function composeSource(s,choice=s.draft?.source){
+ const primary=s.account?.bundle?.primary;if(!primary)return null;
+ return choice?.startsWith('trip:')?primary.trips.find(t=>'trip:'+t.id===choice&&t.payload.planBase):choice==='place:saved-places'?primary.places:null;
+}
+function resetSelection(s,choice){
+ s.draft={...s.draft,source:choice};const source=composeSource(s,choice);
+ s.selection=source?{choice,accountRevision:s.account.revision,source,signature:JSON.stringify(source),ids:[]}:null;
+}
+function checkedSelection(s,choice){
+ const selected=s.selection,source=composeSource(s,choice);
+ if(!s.compose||!selected||!source||selected.choice!==choice||selected.source!==source||selected.accountRevision!==s.account.revision||selected.signature!==JSON.stringify(source))throw Error('selection-source-changed');
+ const allowed=choice.startsWith('trip:')?Object.keys(source.payload.planBase):source.places.map(p=>p.id);
+ if(new Set(allowed).size!==allowed.length||selected.ids.some(id=>!allowed.includes(id)))throw Error('selection-invalid');
+ return {selected,source,allowed};
+}
+function selectionHTML(s){
+ const choice=s.draft?.source,source=composeSource(s,choice);if(!source)return '';
+ const selected=s.selection?.choice===choice?s.selection.ids:[],trip=choice.startsWith('trip:');
+ const checkbox=(id,label)=>'<label class="social-share-choice"><input type="checkbox" data-social-account="selection-toggle" data-id="'+esc(id)+'" '+(selected.includes(id)?'checked ':'')+(s.working?'disabled ':'')+'><span>'+label+'</span></label>';
+ const rows=trip?Object.keys(source.payload.planBase).map((key,index)=>{
+  const date=source.payload.dayDates?.[key]||(typeof TripCore!=='undefined'&&TripCore.validDate(source.payload.conditions?.start)?TripCore.dateFor(source.payload,Number(key)):null);
+  return checkbox(key,esc(index+1)+'번째 날짜 · '+esc(date||'날짜 미정')+'<span class="social-share-stops">'+source.payload.planBase[key].map((stop,i)=>'<span>'+esc(i+1)+'. '+esc(stop.time||'시간 미정')+' · '+esc(stop.name)+'</span>').join('')+'</span>');
+ }):source.places.map((place,index)=>checkbox(place.id,esc(index+1)+'. '+esc(place.name)+(place.location?' · '+esc(place.location):'')));
+ return '<fieldset class="social-share-selection"><legend>'+esc(trip?source.payload.title+' · 공유할 날짜':'공유할 저장 장소')+'</legend><p>'+(trip?'선택한 날짜의 일정·장소 전체를 포함합니다. 개별 일정 선택은 지원하지 않습니다.':'선택한 장소만 포함합니다.')+' 선택하지 않은 항목은 공유하지 않습니다.</p>'+rows.join('')+'<p role="status">선택 '+esc(selected.length)+'개 · 하나 이상 직접 선택해 주세요.</p></fieldset>';
+}
 function composeHTML(s){
  const primary=s.account?.bundle?.primary,d=s.draft||{};
  if(!primary)return '<p class="notice">계정에 저장한 전체 개인 자료가 없습니다. 전체 개인 자료 화면에서 계정 저장을 먼저 검토해 주세요.</p>';
- const trips=primary.trips.filter(t=>t.payload.planBase),option=(value,label)=>'<option value="'+esc(value)+'" '+(d.source===value?'selected':'')+'>'+esc(label)+'</option>',input=(name,label)=>'<label class="field">'+label+'<input class="input" name="'+name+'" value="'+esc(d[name]||'')+'"></label>';
- return '<form id="social-account-compose"><fieldset style="border:0;padding:0;margin:0" '+(s.working?'disabled':'')+'><p>계정에 저장한 시점의 원본입니다. 현재 기기의 미저장 편집은 포함하지 않습니다.</p><label class="field">공유할 계정 원본<select class="select" name="source">'+trips.map(t=>option('trip:'+t.id,'여행 · '+t.payload.title)).join('')+(primary.places.places.length?option('place:saved-places','저장 장소'):'')+'</select></label>'+(!trips.length?'<p>공유 가능한 명시 일정이 없습니다. 저장 장소를 선택하거나 계정 일정 저장을 먼저 확인하세요.</p>':'')+input('days','여행 날짜 번호 · 쉼표 구분, 비우면 전체')+input('placeIds','저장 장소 ID · 쉼표 구분, 비우면 전체')+'<details><summary>원본 날짜·장소 ID 확인</summary>'+trips.map(t=>'<p>'+esc(t.payload.title)+' · 날짜 '+Object.keys(t.payload.planBase).map(esc).join(', ')+'</p>').join('')+'<ul>'+primary.places.places.map(p=>'<li>'+esc(p.name)+' · '+esc(p.id)+'</li>').join('')+'</ul></details><label class="field">새로 작성할 공유 설명<textarea class="input" name="description">'+esc(d.description||'')+'</textarea></label><label class="field">대상<select class="select" name="audience"><option value="INVITED_MEMBERS" '+(d.audience!=='DESIGNATED'?'selected':'')+'>발행 시 활성 초대 회원 전체 · 서버 정책 필요</option><option value="DESIGNATED" '+(d.audience==='DESIGNATED'?'selected':'')+'>서버 회원 목록에서 지정</option></select></label>'+recipientHTML(s)+button(s,'미리보기 요청만 기기에 준비','prepare-preview')+'</fieldset></form>';
+ const trips=primary.trips.filter(t=>t.payload.planBase),option=(value,label)=>'<option value="'+esc(value)+'" '+(d.source===value?'selected':'')+'>'+esc(label)+'</option>';
+ return '<form id="social-account-compose"><fieldset style="border:0;padding:0;margin:0" '+(s.working?'disabled':'')+'><p>계정에 저장한 시점의 원본입니다. 현재 기기의 미저장 편집은 포함하지 않습니다.</p><label class="field">공유할 계정 원본<select class="select" name="source">'+trips.map((t,i)=>option('trip:'+t.id,'여행 '+(i+1)+' · '+t.payload.title)).join('')+(primary.places.places.length?option('place:saved-places','저장 장소'):'')+'</select></label>'+(!trips.length?'<p>공유 가능한 명시 일정이 없습니다. 저장 장소를 선택하거나 계정 일정 저장을 먼저 확인하세요.</p>':'')+selectionHTML(s)+'<label class="field">새로 작성할 공유 설명<textarea class="input" name="description">'+esc(d.description||'')+'</textarea></label><label class="field">대상<select class="select" name="audience"><option value="INVITED_MEMBERS" '+(d.audience!=='DESIGNATED'?'selected':'')+'>발행 시 활성 초대 회원 전체 · 서버 정책 필요</option><option value="DESIGNATED" '+(d.audience==='DESIGNATED'?'selected':'')+'>서버 회원 목록에서 지정</option></select></label>'+recipientHTML(s)+button(s,'미리보기 요청만 기기에 준비','prepare-preview')+'</fieldset></form>';
 }
 const COPY_PAGE=50,copyResolutionKeys=['name','type','time','location','googlePlaceId','dwellSeconds','travel'];
 function copyInput(name,label,value,type='text'){return '<label class="field">'+esc(label)+'<input class="input" type="'+type+'" name="'+esc(name)+'" value="'+esc(value??'')+'"></label>';}
@@ -11662,7 +11694,6 @@ async function readShares(s,filter,cursor=null){clearDetail(s);s.compose=false;s
 async function refreshPending(s){s.readyCurrent=false;s.pending=await step(s,()=>s.flow.local());}
 function requireEmpty(s){if(s.pending&&s.pending.status!=='empty')throw Error('social-operation-pending');}
 async function prepare(s,command){requireEmpty(s);s.pending=await step(s,()=>s.flow.prepare({schemaVersion:1,requestId:crypto.randomUUID(),command}));s.compose=false;clearBlocks(s);s.notice='전송하지 않은 요청을 기기에 보관했습니다. 별도 전송 버튼으로 요청합니다.';}
-function selection(raw,numeric=false){if(!raw.trim())return null;const values=raw.split(',').map(x=>x.trim());if(values.some(x=>!x)||new Set(values).size!==values.length)throw Error('selection-invalid');if(!numeric)return values;const nums=values.map(Number);if(nums.some(n=>!Number.isSafeInteger(n)||n<1||n>366))throw Error('selection-invalid');return nums;}
 async function action(s,name,target){
  if(!s.initialized)throw Error('social-unavailable');
  if(name==='blocks'||name==='blocks-next'){const cursor=name==='blocks-next'?s.blockPage?.nextCursor:null;if(name==='blocks-next'&&!cursor)throw Error('block-page-missing');await readBlocks(s,cursor);return;}
@@ -11699,7 +11730,7 @@ async function action(s,name,target){
  }
  if(name==='notifications'||name==='notifications-next'){await readNotifications(s,name==='notifications-next'?s.notifications?.nextCursor:null);return;}
  if(['mine','received','feed'].includes(name)||name==='shares-next'){await readShares(s,name==='shares-next'?s.filter:name,name==='shares-next'?s.shares?.nextCursor:null);return;}
- if(name==='compose'){requireEmpty(s);s.draft=null;s.recipientPage=null;s.recipientIds=[];s.recipientKnown=new Set();s.recipientError=false;clearDetail(s);s.notifications=null;s.shares=null;s.compose=false;s.account=await step(s,()=>s.session.getPersonal());s.compose=true;return;}
+ if(name==='compose'){requireEmpty(s);s.draft=null;s.recipientPage=null;s.recipientIds=[];s.recipientKnown=new Set();s.recipientError=false;clearDetail(s);s.notifications=null;s.shares=null;s.compose=false;s.account=await step(s,()=>s.session.getPersonal());s.compose=true;const primary=s.account?.bundle?.primary,trip=primary?.trips.find(t=>t.payload.planBase);resetSelection(s,trip?'trip:'+trip.id:primary?.places.places.length?'place:saved-places':'');return;}
  if(name==='recipients-search'||name==='recipients-next'){
   const query=s.draft?.recipientQuery||'',cursor=name==='recipients-next'?s.recipientPage?.nextCursor:null;if(name==='recipients-next'&&(!cursor||s.recipientPage.query!==query))throw Error('selection-invalid');
   s.recipientPage=null;s.recipientError=false;
@@ -11708,13 +11739,18 @@ async function action(s,name,target){
  if(name==='recipient-toggle'||name==='recipient-remove'||name==='recipients-clear'){
   if(name==='recipients-clear'){s.recipientIds=[];return;}const id=target.dataset.id;if(name==='recipient-remove'){s.recipientIds=s.recipientIds.filter(x=>x!==id);return;}if(!s.recipientPage?.items.some(x=>x.memberId===id)||!s.recipientKnown.has(id))throw Error('selection-invalid');if(s.recipientIds.includes(id))s.recipientIds=s.recipientIds.filter(x=>x!==id);else if(s.recipientIds.length<s.recipientLimit)s.recipientIds.push(id);else s.notice='서버 정책의 지정 회원 한도에 도달했습니다.';return;
  }
+ if(name==='selection-toggle'){
+  const {selected,allowed}=checkedSelection(s,s.draft?.source),id=target.dataset.id;
+  if(!allowed.includes(id))throw Error('selection-invalid');selected.ids=selected.ids.includes(id)?selected.ids.filter(x=>x!==id):[...selected.ids,id];return;
+ }
  if(name==='prepare-preview'){
   requireEmpty(s);const fields=target.formValues;if(!fields||!s.account?.bundle)throw Error('source-missing');
   const choice=fields.source,kind=choice.startsWith('trip:')?'trip':choice==='place:saved-places'?'place':null;
   const source=kind==='trip'?s.account.bundle.primary.trips.find(t=>'trip:'+t.id===choice):kind==='place'?s.account.bundle.primary.places:null;
   if(!source)throw Error('source-missing');
-  const command={schemaVersion:1,type:'share-preview',source:{kind,id:kind==='trip'?source.id:'saved-places',revision:source.revision,hash:await step(s,()=>PersonalBackup.digest(source))},expectedAccountRevision:s.account.revision,selection:{days:kind==='trip'?selection(fields.days,true):null,placeIds:kind==='place'?selection(fields.placeIds):null,description:fields.description},audience:fields.audience==='DESIGNATED'?{mode:'DESIGNATED',memberIds:(target.memberIds||[])}:{mode:'INVITED_MEMBERS'}};
-  await prepare(s,command);return;
+  const {selected}=checkedSelection(s,choice),ids=[...selected.ids];if(!ids.length)throw Error('selection-empty');
+  const command={schemaVersion:1,type:'share-preview',source:{kind,id:kind==='trip'?source.id:'saved-places',revision:source.revision,hash:await step(s,()=>PersonalBackup.digest(source))},expectedAccountRevision:s.account.revision,selection:{days:kind==='trip'?ids.map(Number):null,placeIds:kind==='place'?ids:null,description:fields.description},audience:fields.audience==='DESIGNATED'?{mode:'DESIGNATED',memberIds:(target.memberIds||[])}:{mode:'INVITED_MEMBERS'}};
+  checkedSelection(s,choice);await prepare(s,command);return;
  }
  if(name==='notice'||name==='detail'){
   clearDetail(s);s.shares=null;s.notice='현재 열람 권한을 확인하고 있습니다.';render(s);
@@ -11769,10 +11805,11 @@ async function open(session,view='notifications'){
 }
 function captureDraft(s){
  const form=s.compose&&document.querySelector('#social-account-compose');
- if(form)s.draft=Object.fromEntries(['source','days','placeIds','description','audience','recipientQuery'].map(k=>[k,form.elements[k]?.value??s.draft?.[k]??'']));
+ if(form)s.draft=Object.fromEntries(['source','description','audience','recipientQuery'].map(k=>[k,form.elements[k]?.value??s.draft?.[k]??'']));
  return form;
 }
 document.addEventListener('change',event=>{
+ const active=current;if(active&&valid(active)&&!active.working&&active.compose&&event.target.name==='source'&&event.target.closest('#social-account-compose')===document.querySelector('#social-account-compose')){captureDraft(active);resetSelection(active,event.target.value);render(active);return;}
  const s=current;if(s&&valid(s)&&!s.working&&event.target.name==='reportReason'&&event.target.closest('#server-social-account-panel')===s.panel){s.reportReason=event.target.value;render(s);return;}if(!s||!valid(s)||s.working||!s.copy||event.target.closest('#social-account-copy')!==document.querySelector('#social-account-copy'))return;
  captureCopy(s);if(event.target.name==='destination'||/^item-\d+-action$|^day-(?:null|\d+)-(?:key|position)$/.test(event.target.name))render(s);
 });
@@ -11792,7 +11829,9 @@ document.addEventListener('click',event=>{
  }
  if(captureDraft(s))captured.formValues={...s.draft};
  if(target.dataset.socialAccount==='prepare-preview'){captured.memberIds=[...(s.recipientIds||[])];if(captured.memberIds.some(id=>!s.recipientKnown?.has(id))||captured.memberIds.length>(s.recipientLimit||0))return;}
- void run(s,()=>action(s,captured.dataset.socialAccount,captured));
+ void run(s,()=>action(s,captured.dataset.socialAccount,captured)).then(()=>{
+  if(captured.dataset.socialAccount==='selection-toggle'&&valid(s))Array.from(s.panel.querySelectorAll?.('[data-social-account="selection-toggle"]')||[]).find(node=>node.dataset.id===captured.dataset.id)?.focus();
+ });
 });
 document.querySelector('#dialog')?.addEventListener('cancel',event=>{if(current?.working)event.preventDefault();});
 root.ServerSocialAccountUI={open,configure,afterRender,isAccountMode:()=>configured,isBusy:()=>!!current?.working,cancelPending(force=false){if(current?.working&&!force)return true;if(current){purge(current);current=null;}return false;}};
